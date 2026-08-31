@@ -1,0 +1,10 @@
+.pio
+.vscode
+.selftest-fs
+selftest
+selftest.dSYM
+*.test.o
+.DS_Store
+
+# the schematic itself lives in EasyEDA, not here - see docs/hardware.md
+*.pdf
