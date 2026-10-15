@@ -196,6 +196,18 @@ static void drawFooter(const UiModel &m) {
         return;
     }
 
+    // The pager's own controls mean nothing in app mode. What is worth a
+    // glance is that the radio is still hearing things.
+    if (m.view == VIEW_APP) {
+        char age[8];
+        snprintf(buf, sizeof(buf), "nodes %d", m.nodes);
+        oled.drawStr(0, 62, buf);
+        fmtAge(m.lastRxMs, age, sizeof(age));
+        snprintf(buf, sizeof(buf), "rx %s", age);
+        oled.drawStr(W - oled.getStrWidth(buf), 62, buf);
+        return;
+    }
+
     int count = Messages::count();
     if (count > 0 && m.sel < count) snprintf(buf, sizeof(buf), "%d/%d", m.sel + 1, count);
     else                            snprintf(buf, sizeof(buf), "INFO");
@@ -323,6 +335,18 @@ static void drawFetch(const UiModel &m) {
     oled.drawStr((W - oled.getStrWidth(buf)) / 2, 50, buf);
 }
 
+static void drawApp(const UiModel &) {
+    oled.setFont(FONT_BIG);
+    const char *t = "APP MODE";
+    oled.drawStr((W - oled.getStrWidth(t)) / 2, 27, t);
+
+    oled.setFont(FONT_SMALL);
+    t = "messages go to the app";
+    oled.drawStr((W - oled.getStrWidth(t)) / 2, 39, t);
+    t = "close it to resume";
+    oled.drawStr((W - oled.getStrWidth(t)) / 2, 48, t);
+}
+
 static void drawBoot(const UiModel &m) {
     oled.setFont(FONT_BIG);
     const char *t = "MeshCore";
@@ -369,6 +393,7 @@ void Ui::render(const UiModel &m) {
             if (m.view == VIEW_ALERT)        drawAlert(m);
             else if (m.view == VIEW_FETCH)   drawFetch(m);
             else if (m.view == VIEW_STATUS)  drawStatus(m);
+            else if (m.view == VIEW_APP)     drawApp(m);
             else if (Messages::count() == 0) drawEmpty(m);
             else                             drawMessage(m);
             drawFooter(m);

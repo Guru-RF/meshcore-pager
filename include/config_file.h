@@ -56,7 +56,10 @@
 #define DEFAULT_PREAMBLE        16
 #define DEFAULT_TX_POWER        17
 
-#define PAGER_MAX_CHANNELS      4
+// Each subscribed channel costs one selector-byte compare per packet heard,
+// so the limit is about the config line and the app's channel list, not
+// about load.
+#define PAGER_MAX_CHANNELS      8
 #define PAGER_CHAN_LEN          20
 
 struct PagerConfig {
@@ -206,6 +209,8 @@ static bool configCreateDefault() {
     f.println("");
     f.println("# Public channels to listen on. The key is derived from the name");
     f.println("# (SHA256 of it), so no key exchange - anyone with the name reads it.");
+    f.println("# Public, without a #, is MeshCore's built-in channel: its key is");
+    f.println("# published rather than derived.");
     f.println("channels=#mbox,#mesh");
     f.println("# Where 'fetch' is sent and mail comes back.");
     f.println("mboxChannel=#mbox");

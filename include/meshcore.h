@@ -72,6 +72,13 @@ struct MeshPacket {
 // - so there is no key exchange: anyone who knows the name can read it,
 // which is the point on an amateur band where obscuring meaning is not
 // allowed anyway.
+//
+// The one exception is MeshCore's built-in channel, MC_PUBLIC_CHANNEL - the
+// one every app starts with. Its key is not derived from anything: it is a
+// fixed key published in upstream's source and in every app, and being
+// published is what keeps it public. "#public" is a different channel.
+#define MC_PUBLIC_CHANNEL "Public"
+
 struct MeshChannel {
     char    name[PAGER_CHAN_LEN];
     uint8_t key[32];                        // 16 significant bytes, zero-padded
@@ -123,6 +130,10 @@ bool advertVerify(const MeshPacket &p, uint8_t outPub[MC_PUB_KEY_SIZE]);
 
 bool advertInfo(const MeshPacket &p, uint8_t *type, char *name, size_t nameSz,
                 bool *hasLoc, double *lat, double *lon, uint32_t *ts);
+
+// The advert node type config.txt's nodeType names: chat, repeater, room or
+// sensor, and chat for anything else.
+uint8_t advertType(const PagerConfig &cfg);
 
 // Build a signed self-advert. `unixTime` must be real: MeshCore uses the
 // advert timestamp for freshness, so a fabricated one poisons the mesh.

@@ -8,6 +8,10 @@ and makes a noise when something is addressed to your call. It advertises
 itself on the mesh, works out roughly where it is from the repeaters it
 hears, and gets its clock from `#mesh`.
 
+Plug it into something running a MeshCore app and the app can use it as its
+radio too - read, send, see who is around - while the pager carries on
+doing all of the above. See [With a MeshCore app](#with-a-meshcore-app).
+
 Hardware: [docs/hardware.md](docs/hardware.md). Wire formats are shared with
 [meshcore-repeater](../meshcore-repeater) and verified against it by
 `make test`.
@@ -23,6 +27,7 @@ One button. What it does depends on what is on screen.
 | Press | Next message. One press past the oldest lands on the status page, then it wraps. |
 | Hold (0.7 s), more than `fetchCooldown` since the last fetch | Fetch your mail from `#mbox`. |
 | Hold (0.7 s), within `fetchCooldown` of the last fetch | Delete the message on screen. |
+| Press or hold, while an app is attached | Nothing but `APP MODE - USE THE APP` - see [With a MeshCore app](#with-a-meshcore-app). |
 
 The bottom right of the screen always says which of the two a hold will do -
 `HOLD:FETCH` or `HOLD:DEL` - so you never have to remember how long ago you
@@ -61,6 +66,7 @@ glance at:
 | LED | Meaning |
 |---|---|
 | Red, breathing | The radio did not start |
+| Purple blip | App mode: a MeshCore app is attached |
 | Blue, breathing | A fetch is out, waiting for the reply |
 | Orange blip | Unread messages |
 | Amber, breathing | Charging |
@@ -91,7 +97,7 @@ keep it, so an old `config.txt` on a deployed pager still boots.
 | `meshName` | same as `call` | Advertised name, and the prefix on anything the pager sends. |
 | `nodeType` | `chat` | `chat`, `repeater`, `room` or `sensor`. |
 | `route` | `flood` | Route type for adverts. A pager is a leaf, so its advert has to travel on its own legs. |
-| `channels` | `#mbox,#mesh` | Public channels to listen on, up to four. The key is derived from the name, so there is no key exchange. |
+| `channels` | `#mbox,#mesh` | Public channels to listen on, up to eight. The key is derived from the name, so there is no key exchange. `Public`, without a `#`, is MeshCore's built-in channel - the one every app starts with - whose key is published rather than derived. `#public` is a different channel. |
 | `mboxChannel` | `#mbox` | Where `fetch` is sent and mail comes back. |
 | `timeChannel` | `#mesh` | Where repeaters answer `time` and `date`. |
 | `alertOn` | `mention` | `mention` alarms only for traffic addressed to you and chirps for the rest. `all` alarms for everything. |
@@ -116,6 +122,57 @@ naming them is already a statement that you want to hear them.
 which is its address on the mesh, and it cannot be regenerated: a new one is
 a different node. Copy it off before anything that reformats the drive.
 
+## With a MeshCore app
+
+The pager speaks MeshCore's companion protocol on its USB serial port, the
+same port the drive arrives with. Anything that can talk to a MeshCore
+companion radio over USB serial can attach to it - meshcore-cli, the
+`meshcore` Python library, or an app's serial/USB connection. There is no
+Bluetooth and no Wi-Fi: the board has neither radio.
+
+What the app gets:
+
+| | |
+|---|---|
+| Messages | Everything the pager decrypts, on every channel in `channels`. The last 16 are kept while no app is attached and handed over when one connects. |
+| Sending | On any of those channels, as `meshName`, exactly as another MeshCore client would. |
+| Contacts | Every node heard advertising since boot, with its position. Kept in RAM, so a reboot starts the list again. |
+| The clock | An app can set the pager's clock from the phone - which also lets a pager indoors, out of earshot of `#mesh`, start advertising. |
+| Advert | The app's advert button, flood or zero-hop. Refused until the clock is set, like the schedule's. |
+| Packet log | Every packet the radio hears, raw, live. |
+| Statistics | Battery, uptime, noise floor, last RSSI/SNR, airtime and packet counts. |
+
+What it refuses, with an error rather than a pretend success:
+
+- **Direct messages.** For the reason in
+  [What it deliberately does not do](#what-it-deliberately-does-not-do).
+- **Settings** - name, position, radio, channels. `config.txt` is the
+  configuration, and the drive it lives on belongs to the computer or phone
+  for as long as USB is attached, which for a USB link is always. Edit
+  `config.txt` instead; the app shows the channels from it in the order
+  they are listed there, with `mboxChannel` and `timeChannel` appended if
+  they were missing.
+- **Exporting the private key.** `/meshid.bin` is on the drive already.
+
+**While an app is attached the pager is in app mode**, from the moment the
+app first speaks until it closes the port or the cable comes out. The app is
+the interface then, and the pager steps aside:
+
+- Messages go to the app and nowhere else. The pager does not store them,
+  alarm or chirp, so nothing heard in app mode is on the pager afterwards.
+  What it had stored before is left alone, unread ones included.
+- The screen says `APP MODE`, and the LED blips purple.
+- The button does nothing but say `APP MODE - USE THE APP`. No scrolling, no
+  fetch, no delete. An alarm that was sounding when the app attached stops,
+  and a fetch that was out is forgotten - its reply reaches the app on
+  `#mbox`.
+- What keeps the pager on the mesh carries on: adverts, the clock from
+  `#mesh`, and learning its position.
+
+When the app lets go the screen says `PAGER MODE` and everything is as it
+was. With `debug=true` the serial log is quiet for the same span - text in
+the middle of the app's frames would break them.
+
 ## How it knows where it is
 
 It has no GPS. It listens for repeater adverts, takes the position of the
@@ -133,7 +190,7 @@ Set `locator` if you would rather say where you are yourself.
 ## How it knows the time
 
 There is no RTC either, so the clock also comes off the mesh, from two
-sources:
+sources - or from a phone, when one is attached:
 
 1. **`#mesh`.** The pager sends `date`, then `time`. The repeater answers
    *at* a minute boundary, precisely so a device with no clock gets an exact
@@ -141,14 +198,17 @@ sources:
 2. **A repeater's advert.** Every advert carries a signed UNIX timestamp. The
    pager uses one to bootstrap a clock that has never been set, which usually
    happens within seconds of switching on, long before `#mesh` answers.
+3. **A MeshCore app on USB.** An app can set the radio's clock from the
+   phone's. A phone keeps network time, so this is trusted as `#mesh` is: it
+   sets the clock outright, even one that is already running.
 
-Once `#mesh` has answered, nothing an advert says can move the clock, so a
-replayed old advert cannot drag it backwards.
+Once `#mesh` or an app has set it, nothing an advert says can move the
+clock, so a replayed old advert cannot drag it backwards.
 
 **Until the clock is real, the pager does not advertise.** MeshCore uses the
 advert timestamp for freshness, so a made-up one poisons the mesh. Indoors
-and out of range it stays silent and shows `--:--` and a yellow LED. That is
-the design, not a fault.
+and out of range it stays silent and shows `--:--` and a yellow LED - until
+an app gives it the time. That is the design, not a fault.
 
 ## Building
 
@@ -167,6 +227,9 @@ even share an Ed25519 implementation - the pager uses orlp/ed25519, the
 repeater TweetNaCl - so the advert tests double as proof that the signatures
 really are interoperable RFC 8032 and not merely self-consistent.
 
+It also plays an app against the companion protocol, byte for byte, and
+hands what that puts on the air to the repeater's code to decrypt.
+
 ## What it deliberately does not do
 
 - **It does not forward.** A pager is a leaf. A battery-powered device in a
@@ -174,8 +237,10 @@ really are interoperable RFC 8032 and not merely self-consistent.
 - **It does not read private messages.** Unicast needs a key exchange this
   firmware does not do. Public channels only, which on an amateur band is the
   only thing that is allowed anyway.
-- **It does not send messages.** It transmits three things: its own advert,
-  `fetch` on `#mbox`, and `time`/`date` on `#mesh`. There is no keyboard.
+- **It does not send messages of its own.** It transmits three things: its
+  own advert, `fetch` on `#mbox`, and `time`/`date` on `#mesh`. There is no
+  keyboard - except an attached app's, which can send on the channels in
+  `config.txt`.
 
 ## Licence
 

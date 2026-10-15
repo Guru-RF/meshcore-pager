@@ -15,6 +15,11 @@
 //
 // Everything the pager knows lives in the UiModel below and is drawn from
 // there, so the screen cannot disagree with the state that drives the LED.
+//
+// A MeshCore app on the USB port can use it as its radio as well - see
+// include/companion.h. While one is attached the pager is in app mode: the
+// app is the interface, so nothing above happens - no store, no alarm, and
+// the button only says so. It all comes back when the app lets go.
 // ============================================================
 
 #include <Arduino.h>
@@ -23,6 +28,7 @@
 #include <hardware/watchdog.h>
 
 #include "alerts.h"
+#include "companion.h"
 #include "config_file.h"
 #include "grid.h"
 #include "messages.h"
@@ -32,7 +38,8 @@
 #include "radio.h"
 #include "ui.h"
 
-#define VERSION "1.0.0"
+#define VERSION      "1.1.0"
+#define VERSION_DATE "15 Oct 2026"
 
 static PagerConfig cfg;
 static UiModel     ui;
@@ -54,7 +61,11 @@ static bool     clockWasValid  = false;
 
 static uint32_t nextTimeReqMs  = 20000;    // first request 20 s after boot
 static int      timeReqTries   = 0;
-static bool     timeReqWantDate = true;
+
+// The repeater answers a #mesh time or date request at the next minute
+// boundary, and the flood back takes a few seconds more. A request repeated
+// sooner than this goes out again while its answer is still on the way.
+static const uint32_t TIME_RETRY_MS = 90000;
 
 static uint32_t lastInteractionMs = 0;
 static uint32_t lastRenderMs      = 0;
@@ -62,6 +73,17 @@ static bool     uiDirty           = true;
 
 static uint32_t nextBattMs = 0;
 static float    battFilt   = 0.0f;
+
+static bool     portWasOpen = false;
+static bool     appWasActive = false;
+
+// By route, for the app's statistics page. Radio.cpp counts the rest.
+static uint32_t nRecvFlood = 0, nRecvDirect = 0, nSentFlood = 0, nSentDirect = 0;
+
+static bool isFloodHeader(uint8_t header) {
+    uint8_t rt = header & PH_ROUTE_MASK;
+    return rt == ROUTE_TYPE_FLOOD || rt == ROUTE_TYPE_TRANSPORT_FLOOD;
+}
 
 // Repeaters heard, for the position estimate. Keyed by the first four bytes
 // of the public key, which is what identifies a node on the mesh.
@@ -80,7 +102,9 @@ static bool   haveLocation = false;
 // ---- small helpers ----
 
 static void logf(const char *fmt, ...) {
-    if (!cfg.debug) return;
+    // An app on the port reads it as frames; a line of text in the middle
+    // would knock its parser out of step.
+    if (!cfg.debug || Companion::active()) return;
     char buf[200];
     va_list ap;
     va_start(ap, fmt);
@@ -143,6 +167,8 @@ static bool sendFrame(const uint8_t *frame, int len) {
     Mesh::rememberFrame(frame, (size_t)len);
     bool ok = Radio::send(frame, (size_t)len);
     if (!ok) logf("tx failed (%d bytes)", len);
+    else if (isFloodHeader(frame[0])) nSentFlood++;
+    else nSentDirect++;
     return ok;
 }
 
@@ -156,16 +182,21 @@ static bool sendChannelText(const MeshChannel &ch, const char *text, uint8_t rou
     return sendFrame(frame, n);
 }
 
-static void sendAdvert() {
+// `route` overrides config.txt's route= for this one advert, which is how
+// the app asks for flood or zero-hop. Only the header carries the route -
+// the signature covers the key, the timestamp and the app data - so it can
+// be changed after signing.
+static bool sendAdvert(int route = -1) {
     uint8_t frame[MC_MAX_TRANS_UNIT];
     int n = Mesh::buildAdvert(frame, sizeof(frame), cfg, haveLocation, myLat, myLon,
                               PagerClock::now());
-    if (n < 0) return;
+    if (n < 0) return false;
+    if (route >= 0) frame[0] = (uint8_t)((frame[0] & ~PH_ROUTE_MASK) | route);
     Alerts::play(ALERT_TX);
-    if (sendFrame(frame, n)) {
-        ui.adverts++;
-        logf("advert sent (%d bytes)%s", n, haveLocation ? " with position" : "");
-    }
+    if (!sendFrame(frame, n)) return false;
+    ui.adverts++;
+    logf("advert sent (%d bytes)%s", n, haveLocation ? " with position" : "");
+    return true;
 }
 
 // ---- position ----
@@ -263,14 +294,20 @@ static void storeMessage(const MeshChannel &ch, const MeshPacket &p, uint32_t ts
     uiDirty = true;
 }
 
-static void handleChannelText(const MeshChannel &ch, const MeshPacket &p, uint32_t ts,
+static void handleChannelText(int chan, const MeshPacket &p, uint32_t ts,
                               const char *sender, const char *body) {
+    const MeshChannel &ch = channels[chan];
+
     // Our own message, re-flooded back at us by a repeater whose copy has a
     // different path. The dedup hash catches this already; the name check is
     // the backstop for the case where it has aged out of the ring.
     if (sender[0] && strcasecmp(sender, cfg.meshName) == 0) return;
 
     logf("rx %s <%s> %s  (%d dBm)", ch.name, sender, body, p.rssi);
+
+    // Queued for the app whether or not one is attached, so one that
+    // attaches later still gets it.
+    Companion::onChannelText(chan, p, ts, sender, body);
 
     // The clock. Both lines are also stored and shown, because "display
     // everything you hear" is the whole point of the device - they simply
@@ -282,6 +319,11 @@ static void handleChannelText(const MeshChannel &ch, const MeshPacket &p, uint32
             uiDirty = true;
         }
     }
+
+    // App mode. The app has the message and shows it; a copy in the store
+    // would be a second inbox to clear, and an alarm would be about
+    // something already on the phone.
+    if (Companion::active()) return;
 
     bool mention = bodyMentionsUs(body);
 
@@ -339,6 +381,8 @@ static void handleAdvert(const MeshPacket &p) {
     logf("advert <%s> type %u %s (%d dBm)", name, type,
          hasLoc ? "with position" : "no position", p.rssi);
 
+    Companion::onAdvert(pub, type, name, hasLoc, lat, lon, ts);
+
     // Only a repeater's clock is worth borrowing: it is the class of node
     // that has one. And only until #mesh answers - see pagerclock.h.
     if (type == ADV_TYPE_REPEATER) {
@@ -375,13 +419,15 @@ static void handlePacket(const uint8_t *raw, int len, int16_t rssi, int8_t snrQ)
     if (type != PAYLOAD_TYPE_GRP_TXT) return;
 
     for (int i = 0; i < cfg.nChannels; i++) {
+        // Sized for the whole plaintext rather than for the message store:
+        // the app gets the text uncut, and storeMessage() cuts its own copy.
         uint32_t ts = 0;
-        char sender[MSG_FROM_LEN];
-        char body[MSG_TEXT_LEN];
+        char sender[32];
+        char body[MC_MAX_PACKET_PAYLOAD];
         if (!Mesh::decryptGroupText(channels[i], p, &ts, sender, sizeof(sender),
                                     body, sizeof(body)))
             continue;
-        handleChannelText(channels[i], p, ts, sender, body);
+        handleChannelText(i, p, ts, sender, body);
         return;
     }
 }
@@ -459,6 +505,15 @@ static void onPressStart() {
     Ui::wake();
     uiDirty = true;
 
+    // In app mode the button has nothing to do but say so - a press that
+    // seemed to do nothing would read as a broken pager.
+    if (Companion::active()) {
+        ui.view = VIEW_APP;
+        toast("APP MODE - USE THE APP");
+        Alerts::play(ALERT_ACK);
+        return;
+    }
+
     // "until one presses on the button": any press stops the alarm, and it
     // stops on the way DOWN rather than on release, so holding the button to
     // fetch does not mean holding it through another second of siren.
@@ -471,6 +526,8 @@ static void onPressStart() {
 }
 
 static void onShortPress() {
+    if (Companion::active()) return;          // answered on the way down
+
     // The press that silenced the alarm leaves you looking at the message
     // that caused it. Stepping away from it would be the one thing you did
     // not ask for.
@@ -494,6 +551,8 @@ static void onShortPress() {
 }
 
 static void onLongPress() {
+    if (Companion::active()) return;
+
     // A hold is deliberate: it does what it says whether or not it also
     // silenced an alarm or woke the screen on the way down.
     silencedByThisPress = false;
@@ -530,24 +589,38 @@ static void serviceButton() {
 
 static void serviceTimeSync() {
     if (!timeChan.valid) return;
+
+    // An answer on #mesh - to this pager or to anyone else who asked - or an
+    // app setting the clock is a resync, and the next one is due an interval
+    // after it. Without this, a request scheduled before the answer came in
+    // still goes out, asking for what it has just been told.
+    uint32_t interval = (uint32_t)cfg.timeSyncInterval * 1000;
+    if (PagerClock::synced()) {
+        uint32_t since = millis() - PagerClock::syncedAtMs();
+        if (since < interval) {
+            uint32_t due = millis() + (interval - since);
+            if ((int32_t)(due - nextTimeReqMs) > 0) nextTimeReqMs = due;
+        }
+    }
+
     if ((int32_t)(millis() - nextTimeReqMs) < 0) return;
 
     if (PagerClock::valid()) {
-        // A periodic resync. There is no RTC here, only the RP2040's crystal
-        // and a millisecond counter, and the screen shows minutes.
+        // The periodic resync - there is no RTC here, only the RP2040's
+        // crystal - or, for a clock only seeded from an advert, the request
+        // for the exact minute.
         sendChannelText(timeChan, "time", ROUTE_TYPE_FLOOD);
-        nextTimeReqMs = millis() + (uint32_t)cfg.timeSyncInterval * 1000;
+        nextTimeReqMs = millis() + interval;
         return;
     }
 
-    // Not set yet. The date first: a time on its own cannot be turned into an
-    // epoch, and the repeater answers each at the next minute boundary.
-    sendChannelText(timeChan, timeReqWantDate ? "date" : "time", ROUTE_TYPE_FLOOD);
-    timeReqWantDate = !timeReqWantDate;
+    // Not set yet. Ask for what is missing and nothing else: the date first,
+    // since a time on its own cannot be turned into an epoch, then the time.
+    sendChannelText(timeChan, PagerClock::haveDate() ? "time" : "date", ROUTE_TYPE_FLOOD);
     timeReqTries++;
     // Back off hard once it is clear nothing is answering: a pager that keys
-    // up every 45 seconds forever is worse than a pager with no clock.
-    nextTimeReqMs = millis() + (timeReqTries < 6 ? 45000 : 1800000);
+    // up every 90 seconds forever is worse than a pager with no clock.
+    nextTimeReqMs = millis() + (timeReqTries < 6 ? TIME_RETRY_MS : 1800000);
 }
 
 static void serviceAdvert() {
@@ -572,6 +645,45 @@ static void serviceFetchTimeout() {
     logf("fetch timed out");
 }
 
+// The app's side of the USB port. DTR dropping is the only sign a serial
+// client gives that it has gone; until then, once it has spoken, the port
+// is its. A pulled cable ends it too, which matters for a pager that leaves
+// the desk in app mode: the RP2040 port forces VBUS detect on, so TinyUSB
+// never sees an unplug - but the idle bus reads as a suspend, and
+// tud_ready() turns that into `Serial` going false.
+static void serviceCompanion() {
+    bool open = (bool)Serial;
+    if (portWasOpen && !open) Companion::portClosed();
+    portWasOpen = open;
+
+    // Bounded, so a host pouring bytes in cannot starve the radio poll.
+    for (int i = 0; i < 256 && Serial.available() > 0; i++)
+        Companion::feed((uint8_t)Serial.read());
+    Companion::service();
+
+    if (Companion::active() != appWasActive) {
+        appWasActive = Companion::active();
+        if (appWasActive) {
+            // Whatever the pager was in the middle of is the app's business
+            // now. A running alarm is about a message the app is about to be
+            // handed, and a fetch reply will reach the app as #mbox anyway.
+            if (Alerts::alarming()) Alerts::stop();
+            fetchPending = false;
+            ui.view = VIEW_APP;
+            toast("APP MODE");
+        } else {
+            // The store is as the app found it: nothing was added or deleted
+            // while it was attached.
+            ui.sel  = 0;
+            ui.view = VIEW_MESSAGE;
+            toast("PAGER MODE");
+        }
+        Ui::wake();
+        lastInteractionMs = millis();
+        uiDirty = true;
+    }
+}
+
 static void serviceBattery() {
     if ((int32_t)(millis() - nextBattMs) < 0) return;
     nextBattMs = millis() + 5000;
@@ -589,6 +701,7 @@ static void serviceBattery() {
 // is what makes a screen timeout acceptable on a device you glance at.
 static void serviceIdleLed() {
     if (!Radio::ok())                  Alerts::setIdle(IDLE_BREATHE, 255,   0,   0);
+    else if (Companion::active())      Alerts::setIdle(IDLE_PULSE,   160,   0, 255);
     else if (fetchPending)             Alerts::setIdle(IDLE_BREATHE,   0,  80, 255);
     else if (Messages::unread() > 0)   Alerts::setIdle(IDLE_PULSE,   255,  40,   0);
     else if (ui.charging)              Alerts::setIdle(IDLE_BREATHE, 255, 120,   0);
@@ -617,6 +730,7 @@ static void serviceScreen() {
     ui.identityOk = Mesh::identityOk();
     ui.holdIsFetch = holdWouldFetch();
     ui.fetchStartedMs = fetchPending ? fetchStartedMs : 0;
+    ui.nodes      = Companion::contacts();
 
     Ui::render(ui);
     lastRenderMs = now;
@@ -719,6 +833,41 @@ void setup() {
         snprintf(ui.locator, sizeof(ui.locator), "%s", cfg.locator);
     }
 
+    CompanionHost host;
+    host.cfg       = &cfg;
+    host.channels  = channels;
+    host.nChannels = cfg.nChannels;
+    host.version   = "v" VERSION;
+    host.buildDate = VERSION_DATE;
+    host.writable  = []() { return Serial.availableForWrite(); };
+    host.write     = [](const uint8_t *d, size_t n) { return Serial.write(d, n); };
+    host.transmit  = [](const uint8_t *f, size_t n) { return sendFrame(f, (int)n); };
+    // The app's advert button keeps the schedule's rule: no clock, no advert.
+    host.advert    = [](bool flood) {
+        return PagerClock::valid() && sendAdvert(flood ? ROUTE_TYPE_FLOOD : ROUTE_TYPE_DIRECT);
+    };
+    host.position  = [](double *lat, double *lon) {
+        if (!haveLocation) return false;
+        *lat = myLat;
+        *lon = myLon;
+        return true;
+    };
+    host.batteryMv = []() { return (uint16_t)lroundf(battFilt * 1000.0f); };
+    host.radioStats = [](CompanionRadioStats *s) {
+        s->noiseFloor = Radio::noiseFloor();
+        s->rxAirMs    = Radio::rxAirMs();
+        s->txAirMs    = Radio::txAirMs();
+        s->recv       = Radio::rxCount();
+        s->recvErrors = Radio::rxErrors();
+        s->sent       = Radio::txCount();
+        s->recvFlood  = nRecvFlood;
+        s->recvDirect = nRecvDirect;
+        s->sentFlood  = nSentFlood;
+        s->sentDirect = nSentDirect;
+    };
+    host.reboot    = []() { rp2040.reboot(); };
+    Companion::begin(host);
+
     FatFSUSB.onUnplug([](uint32_t) { rp2040.reboot(); });
     FatFSUSB.driveReady(usbDriveReady);
     FatFSUSB.begin();
@@ -763,9 +912,15 @@ void loop() {
     int16_t  rssi = 0;
     int8_t   snrQ = 0;
     int n = Radio::poll(raw, sizeof(raw), &rssi, &snrQ);
-    if (n > 0) handlePacket(raw, n, rssi, snrQ);
+    if (n > 0) {
+        if (isFloodHeader(raw[0])) nRecvFlood++;
+        else nRecvDirect++;
+        Companion::onRawPacket(raw, (size_t)n, rssi, snrQ);
+        handlePacket(raw, n, rssi, snrQ);
+    }
 
     serviceButton();
+    serviceCompanion();
     Alerts::service();
 
     // The alarm view outlives the alarm by exactly one pass, whether it was

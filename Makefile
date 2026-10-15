@@ -18,7 +18,7 @@ TESTFLAGS = -O1 -g -Wall -Wextra -Wno-unused-function
 TESTINC   = -Iinclude -Ilib/meshcrypto -Ilib/ed25519 -Itools/hostshim -I$(REPEATER)/src
 
 # The pager's own protocol code, compiled for the host against tools/hostshim.
-PAGER_SRC = src/meshcore.cpp src/pagerclock.cpp tools/selftest.cpp
+PAGER_SRC = src/meshcore.cpp src/pagerclock.cpp src/companion.cpp tools/selftest.cpp
 
 # The repeater's real packet/advert/identity code as the counterparty. Its
 # crypto/sha256.c, crypto/aes128.c and hmac_sha256.c are deliberately NOT
@@ -57,12 +57,17 @@ monitor:
 # whose const arrays are legal C and not legal C++.
 TESTOBJ = $(PAGER_SRC:.cpp=.test.o) $(REPEATER_SRC:.c=.test.o) $(CRYPTO_SRC:.c=.test.o)
 
+# -MMD: every object depends on the headers it includes. Without it a change
+# to config_file.h rebuilds only some objects, and the test links two
+# different layouts of PagerConfig - and still reports a pass.
 %.test.o: %.cpp
-	$(CXX) $(TESTFLAGS) $(TESTINC) -c $< -o $@
+	$(CXX) $(TESTFLAGS) -MMD -MP $(TESTINC) -c $< -o $@
 
 # Vendored/third-party C: no warning policy, and TweetNaCl needs C99 or later.
 %.test.o: %.c
-	$(CC) -O1 -g -std=c11 -w $(TESTINC) -c $< -o $@
+	$(CC) -O1 -g -std=c11 -w -MMD -MP $(TESTINC) -c $< -o $@
+
+-include $(TESTOBJ:.o=.d)
 
 selftest: $(TESTOBJ)
 	@test -d $(REPEATER)/src || { echo "need $(REPEATER) checked out beside this one"; exit 1; }
@@ -75,4 +80,4 @@ test: selftest
 clean:
 	$(PIO) run -e pico -t clean
 	rm -rf selftest selftest.dSYM .selftest-fs
-	rm -f $(TESTOBJ)
+	rm -f $(TESTOBJ) $(TESTOBJ:.o=.d)

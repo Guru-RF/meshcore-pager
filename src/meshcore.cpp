@@ -94,17 +94,31 @@ static inline void wrI32le(uint8_t *p, int32_t v) { wrU32le(p, (uint32_t)v); }
 
 // ---- channels ----
 
+// MeshCore's PUBLIC_GROUP_PSK, "izOH6cXN6mrJ5e26oRXNcg==" in base64.
+static const uint8_t PUBLIC_CHANNEL_KEY[16] = {
+    0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
+    0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
+};
+
 void Mesh::channelInit(MeshChannel &c, const char *name) {
     memset(&c, 0, sizeof(c));
     if (!name || !name[0]) return;
-    snprintf(c.name, sizeof(c.name), "%s", name);
 
     SHA256_CTX ctx;
     uint8_t digest[SHA256_BLOCK_SIZE];
-    sha256_init(&ctx);
-    sha256_update(&ctx, (const uint8_t *)c.name, strlen(c.name));
-    sha256_final(&ctx, digest);
-    memcpy(c.key, digest, 16);                  // channel key = SHA256(name)[0..15]
+
+    if (!strcasecmp(name, MC_PUBLIC_CHANNEL)) {
+        // Spelled the way upstream and the apps spell it, whatever case
+        // config.txt used.
+        snprintf(c.name, sizeof(c.name), "%s", MC_PUBLIC_CHANNEL);
+        memcpy(c.key, PUBLIC_CHANNEL_KEY, 16);
+    } else {
+        snprintf(c.name, sizeof(c.name), "%s", name);
+        sha256_init(&ctx);
+        sha256_update(&ctx, (const uint8_t *)c.name, strlen(c.name));
+        sha256_final(&ctx, digest);
+        memcpy(c.key, digest, 16);              // channel key = SHA256(name)[0..15]
+    }
 
     // The selector hashes the raw 16 bytes, not the 32-byte padded form the
     // HMAC uses. That asymmetry is real and easy to get wrong.
@@ -330,19 +344,21 @@ bool Mesh::advertInfo(const MeshPacket &p, uint8_t *type, char *name, size_t nam
     return true;
 }
 
+uint8_t Mesh::advertType(const PagerConfig &cfg) {
+    if (!strcasecmp(cfg.nodeType, "repeater")) return ADV_TYPE_REPEATER;
+    if (!strcasecmp(cfg.nodeType, "room"))     return ADV_TYPE_ROOM;
+    if (!strcasecmp(cfg.nodeType, "sensor"))   return ADV_TYPE_SENSOR;
+    return ADV_TYPE_CHAT;
+}
+
 int Mesh::buildAdvert(uint8_t *frame, size_t frameSz, const PagerConfig &cfg,
                       bool hasLoc, double lat, double lon, uint32_t unixTime) {
     if (!identityLoaded) return -1;
     if (frameSz < 2 + ADV_DATA_OFF + MC_MAX_ADVERT_DATA) return -1;
 
-    uint8_t nodeType = ADV_TYPE_CHAT;
-    if      (!strcasecmp(cfg.nodeType, "repeater")) nodeType = ADV_TYPE_REPEATER;
-    else if (!strcasecmp(cfg.nodeType, "room"))     nodeType = ADV_TYPE_ROOM;
-    else if (!strcasecmp(cfg.nodeType, "sensor"))   nodeType = ADV_TYPE_SENSOR;
-
     uint8_t appData[MC_MAX_ADVERT_DATA];
     size_t  appLen = 1;
-    uint8_t flags  = nodeType;
+    uint8_t flags  = Mesh::advertType(cfg);
 
     if (hasLoc) {
         flags |= ADV_LATLON_MASK;

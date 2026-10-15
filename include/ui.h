@@ -26,6 +26,7 @@ enum UiView {
     VIEW_STATUS,        // node identity, position, link health
     VIEW_ALERT,         // an alarm is sounding
     VIEW_FETCH,         // a fetch is out and we are waiting
+    VIEW_APP,           // a MeshCore app is attached and is the interface
     VIEW_FATAL          // setup failed and said why
 };
 
@@ -53,6 +54,7 @@ struct UiModel {
     bool     holdIsFetch;       // what a long press would do right now
     uint32_t fetchStartedMs;    // 0 = no fetch outstanding
     uint32_t adverts;
+    int      nodes;             // nodes heard advertising, as the app's contacts
 
     int16_t  lastRssi;
     int8_t   lastSnrQ;

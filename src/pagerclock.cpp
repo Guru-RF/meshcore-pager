@@ -8,6 +8,10 @@ static uint32_t baseMillis = 0;
 static int32_t  knownDay   = -1;
 static bool     havePendingTime = false;
 static int      pendingHH = 0, pendingMM = 0;
+static uint32_t pendingMs = 0;       // millis() when the held time line was heard
+
+static bool     everSynced = false;
+static uint32_t syncedAt   = 0;
 
 // Howard Hinnant's days_from_civil: proleptic Gregorian, no table, no libc.
 static int32_t daysFromCivil(int y, unsigned m, unsigned d) {
@@ -20,16 +24,29 @@ static int32_t daysFromCivil(int y, unsigned m, unsigned d) {
 }
 
 bool PagerClock::valid() { return baseUnix != 0; }
+bool PagerClock::haveDate() { return knownDay >= 0; }
+bool PagerClock::synced() { return everSynced; }
+uint32_t PagerClock::syncedAtMs() { return syncedAt; }
 
 uint32_t PagerClock::now() {
     if (!baseUnix) return 0;
     return baseUnix + (millis() - baseMillis) / 1000;
 }
 
-void PagerClock::setUnix(uint32_t unix) {
-    baseUnix   = unix;
-    baseMillis = millis();
-    knownDay   = (int32_t)(unix / 86400u);
+// `unixTime` was the time at millis() == atMs.
+static void setAt(uint32_t unixTime, uint32_t atMs) {
+    baseUnix   = unixTime;
+    baseMillis = atMs;
+    knownDay   = (int32_t)(unixTime / 86400u);
+}
+
+static void markSynced() {
+    everSynced = true;
+    syncedAt   = millis();
+}
+
+void PagerClock::setUnix(uint32_t unixTime) {
+    setAt(unixTime, millis());
 }
 
 bool PagerClock::applyDateLine(const char *body) {
@@ -39,10 +56,13 @@ bool PagerClock::applyDateLine(const char *body) {
 
     knownDay = daysFromCivil(y, (unsigned)mo, (unsigned)d);
 
-    // A "time" that arrived first has been waiting for exactly this.
+    // A "time" that arrived first has been waiting for exactly this. It was
+    // HH:MM:00 when it was heard, not now.
     if (havePendingTime) {
         havePendingTime = false;
-        setUnix((uint32_t)knownDay * 86400u + (uint32_t)pendingHH * 3600u + (uint32_t)pendingMM * 60u);
+        setAt((uint32_t)knownDay * 86400u + (uint32_t)pendingHH * 3600u + (uint32_t)pendingMM * 60u,
+              pendingMs);
+        markSynced();
     } else if (baseUnix) {
         // Keep the running clock's time of day, move it onto the stated date.
         uint32_t sod = PagerClock::now() % 86400u;
@@ -62,17 +82,34 @@ bool PagerClock::applyTimeLine(const char *body) {
         havePendingTime = true;
         pendingHH = hh;
         pendingMM = mm;
+        pendingMs = millis();
         return true;
     }
 
     // The repeater sends this AT the minute boundary, so the seconds really
     // are zero and this is a full resync, not a nudge.
     setUnix((uint32_t)knownDay * 86400u + (uint32_t)hh * 3600u + (uint32_t)mm * 60u);
+    markSynced();
     return true;
 }
 
-void PagerClock::seedFromAdvert(uint32_t unix) {
+// 2023-11 .. 2100: anything outside it is a device that has lost its clock.
+static bool plausible(uint32_t unixTime) {
+    return unixTime >= 1700000000u && unixTime <= 4102444800u;
+}
+
+void PagerClock::seedFromAdvert(uint32_t unixTime) {
     if (baseUnix) return;                       // #mesh, once heard, always wins
-    if (unix < 1700000000u || unix > 4102444800u) return;   // 2023-11 .. 2100, sanity
-    setUnix(unix);
+    if (!plausible(unixTime)) return;
+    setUnix(unixTime);
+}
+
+bool PagerClock::setFromApp(uint32_t unixTime) {
+    if (!plausible(unixTime)) return false;
+    // The clock is set; a time line still waiting for its date has nothing
+    // left to complete.
+    havePendingTime = false;
+    setUnix(unixTime);
+    markSynced();
+    return true;
 }

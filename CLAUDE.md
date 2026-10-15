@@ -27,6 +27,11 @@ one.
 shows up as a failing check rather than as a pager that sits in a pocket
 hearing nothing. It needs the repeater checked out beside this tree.
 
+The companion protocol (`src/companion.cpp`) is in `make test` too, but has
+no C counterparty to link: its checks are byte offsets read off upstream's
+`examples/companion_radio/MyMesh.cpp`. If upstream changes a layout, the
+test will not notice - re-read that file.
+
 `tools/selftest.cpp` contains verbatim copies of `channel_build_txt()` and
 `channel_decrypt()`, which are `static` inside the repeater's `src/mesh.c`
 and cannot be linked. If that file changes, re-copy them - a stale copy
@@ -66,9 +71,31 @@ writes only the sketch region and leaves the filesystem alone.
   and hand back whatever was still in the FIFO.
 - **Adverts are gated on a real clock, not on having a position.** A
   positionless advert is valid and useful; a fabricated timestamp poisons the
-  mesh. That is why the pager is silent indoors.
+  mesh. That is why the pager is silent indoors - unless an app has given it
+  the phone's time.
 - **`config.txt` keys that are absent fall back to firmware defaults**, so a
   default change silently changes behaviour on deployed pagers.
+- **The companion link refuses every settings command.** The FAT that holds
+  `config.txt` belongs to the host while USB is attached, and a USB link is
+  always attached, so a setting could only live in RAM until the next boot.
+  An error is more honest than that. Do not "add" settings by writing to
+  FatFS from the firmware.
+- **The debug log stops once an app has spoken**, until DTR drops. A
+  client scans for `>` to find a frame, and `logf()` lines contain
+  `<sender>` - one line of text desynchronises it.
+- **App mode is `Companion::active()`, and it switches the pager off.**
+  While an app is attached `handleChannelText()` hands the message over and
+  returns before the store, the alarm and the screen; the button only
+  answers `APP MODE`. It ends on DTR dropping - and on a pulled cable, which
+  the RP2040 never reports as an unplug (VBUS detect is forced on). The idle
+  bus reads as a suspend instead, `tud_ready()` goes false and so does
+  `Serial`. Without that, a pager unplugged mid-session would leave the desk
+  never to alarm again.
+- **USB serial writes go nowhere while DTR is low.** That is this core's
+  `SerialUSB`, and upstream's RP2040 companions run on the same core, so
+  every app already asserts DTR. The flip side is that a push to an app that
+  has stopped reading would block for a second; pushes are dropped whole
+  instead (`writeFrame()`, `push`).
 
 ## MeshCore wire format
 
@@ -87,6 +114,11 @@ which vendored it from the repeater, so the three cannot drift.
   on-air selector hashes the raw 16.** All three, in `Mesh::channelInit()`
   and `Mesh::buildGroupText()`. `make test` checks each against the
   repeater's derivation.
+- **`Public` (no `#`) is MeshCore's built-in channel**, and the one channel
+  whose key is not SHA256 of its name: it is upstream's published
+  `PUBLIC_GROUP_PSK`, hard-coded in `Mesh::channelInit()`. Selector and HMAC
+  derive from it exactly as for any other key. `make test` checks it against
+  the repeater's own `base64_decode()` of that PSK.
 - **A `fetch` must be routed FLOOD.** The repeater only treats FLOOD packets
   on `#mbox` as commands; its routed reply comes back DIRECT and has to pass
   other mailboxes untouched. `doFetch()` hard-codes FLOOD whatever
@@ -101,6 +133,11 @@ which vendored it from the repeater, so the three cannot drift.
   a re-flooded copy a duplicate. It is also why `Mesh::rememberFrame()`
   before every transmission works: the repeater's re-flood of our own packet
   comes back with a hop appended and still hashes the same.
+- **The app's channel index is the position in `cfg.channels`**, after
+  `ensureSubscribed()` has appended `mboxChannel` and `timeChannel`. The app
+  is handed the plaintext as `sender: text`, rejoined from the split
+  `decryptGroupText()` made - which is why `handlePacket()` decrypts into
+  buffers sized for the whole payload, not for the message store.
 - **Ed25519: the pager signs with orlp/ed25519, the repeater with
   TweetNaCl.** Both are RFC 8032, and `make test` proves it by having each
   verify the other's adverts. If either side ever stops verifying, that test
@@ -133,4 +170,13 @@ break:
   refuses once the clock is set, so a replayed old advert cannot drag it
   backwards. See `include/pagerclock.h`.
 - A `time` line that arrives before its `date` is **held**, not guessed at.
-  The whole point of asking is to stop guessing.
+  The whole point of asking is to stop guessing. It is held with the
+  `millis()` it was heard at, because it was HH:MM:00 *then*.
+- **The repeater answers `time`/`date` at the next minute boundary**, so an
+  answer can take a minute and more. `serviceTimeSync()` therefore asks only
+  for what is missing (`PagerClock::haveDate()`), never repeats a request
+  within `TIME_RETRY_MS`, and pushes the next request out after any answer
+  on `#mesh`, ours or anyone's (`PagerClock::synced()`). Each of those
+  three was once a duplicate request on air.
+- An app's `SET_DEVICE_TIME` is trusted like `#mesh`
+  (`PagerClock::setFromApp()`): the phone keeps network time.

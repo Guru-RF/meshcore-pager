@@ -25,13 +25,31 @@ static Module modSx1276(PIN_LORA_CS, RADIOLIB_NC, PIN_LORA_RST, RADIOLIB_NC, SPI
 static SX1276 radio(&modSx1276);
 
 static bool     started = false;
-static uint32_t nRx = 0, nTx = 0;
+static uint32_t nRx = 0, nTx = 0, nRxErr = 0;
+static uint32_t rxAir = 0, txAir = 0;
 static PagerConfig conf;
 
 bool Radio::ok() { return started; }
 
 uint32_t Radio::rxCount() { return nRx; }
 uint32_t Radio::txCount() { return nTx; }
+uint32_t Radio::rxErrors() { return nRxErr; }
+uint32_t Radio::rxAirMs() { return rxAir; }
+uint32_t Radio::txAirMs() { return txAir; }
+
+int16_t Radio::noiseFloor() {
+    if (!started) return 0;
+    // In LoRa mode this reads RegRssiValue and nothing else - no change of
+    // mode, so receive carries on. A packet arriving mid-read raises one
+    // sample; the minimum is the floor under it.
+    float lowest = 0;
+    for (int i = 0; i < 4; i++) {
+        float r = radio.getRSSI(false);
+        if (i == 0 || r < lowest) lowest = r;
+        delayMicroseconds(500);
+    }
+    return (int16_t)lroundf(lowest);
+}
 
 bool Radio::begin(const PagerConfig &cfg, char *err, size_t errLen) {
     conf = cfg;
@@ -128,7 +146,10 @@ bool Radio::send(const uint8_t *data, size_t len) {
     radio.finishTransmit();
     watchdog_update();
     Radio::listen();
-    if (done) nTx++;
+    if (done) {
+        nTx++;
+        txAir += timeOnAirMs(len);
+    }
     return done;
 }
 
@@ -141,6 +162,7 @@ int Radio::poll(uint8_t *buf, size_t bufSz, int16_t *rssi, int8_t *snrQ) {
     size_t len = radio.getPacketLength();       // must be read before readData
     if (len == 0 || len > bufSz) {
         Radio::listen();
+        nRxErr++;
         return -1;
     }
 
@@ -153,7 +175,11 @@ int Radio::poll(uint8_t *buf, size_t bufSz, int16_t *rssi, int8_t *snrQ) {
 
     Radio::listen();
 
-    if (state != RADIOLIB_ERR_NONE) return -1;  // CRC mismatch and friends
+    rxAir += timeOnAirMs(len);                  // on air whether or not the CRC held
+    if (state != RADIOLIB_ERR_NONE) {           // CRC mismatch and friends
+        nRxErr++;
+        return -1;
+    }
     nRx++;
     return (int)len;
 }

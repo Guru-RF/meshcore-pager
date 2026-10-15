@@ -43,8 +43,15 @@ uint32_t timeOnAirMs(size_t len);
 // Read the settings back out of the chip, for the boot banner.
 void describe(char *buf, size_t len);
 
-// Counters for the status screen.
+// Counters for the status screen and the app's statistics page.
 uint32_t rxCount();
 uint32_t txCount();
+uint32_t rxErrors();            // frames dropped for CRC or length
+uint32_t rxAirMs();             // time on air of everything received
+uint32_t txAirMs();             // and of everything sent
+
+// What the receiver hears between packets, dBm: the lowest of a few reads of
+// the live RSSI register. 0 when the radio did not start.
+int16_t  noiseFloor();
 
 }  // namespace Radio
