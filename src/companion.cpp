@@ -1,5 +1,7 @@
 #include "companion.h"
 
+#include <math.h>
+
 #include "pagerclock.h"
 
 static CompanionHost host;
@@ -369,6 +371,42 @@ static void channelInfo(uint8_t idx) {
     writeFrame(out, 2 + 32 + 16, false);
 }
 
+// ---- telemetry ----
+//
+// Cayenne LPP, as upstream's CayenneLPP writes it: channel, type, then the
+// value big-endian. Upstream answers a request for its own telemetry with
+// the battery and the MCU's temperature, and so does the pager. A position
+// would go here too on a board with a GPS; this one's is in SELF_INFO.
+
+#define TELEM_CHANNEL_SELF   1
+#define LPP_TEMPERATURE    103          // 0.1 degC, signed 16
+#define LPP_VOLTAGE        116          // 0.01 V, unsigned 16
+
+static size_t putBE16(uint8_t *p, int32_t v) {
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
+    return 2;
+}
+
+static void selfTelemetry() {
+    size_t i = 0;
+    out[i++] = PUSH_CODE_TELEMETRY_RESPONSE;
+    out[i++] = 0;                                   // reserved
+    memcpy(&out[i], Mesh::publicKey(), 6); i += 6;  // whose, as a key prefix
+
+    out[i++] = TELEM_CHANNEL_SELF;
+    out[i++] = LPP_VOLTAGE;
+    i += putBE16(&out[i], (host.batteryMv() + 5) / 10);
+
+    float t = host.mcuTempC();
+    if (!isnan(t)) {
+        out[i++] = TELEM_CHANNEL_SELF;
+        out[i++] = LPP_TEMPERATURE;
+        i += putBE16(&out[i], (int32_t)lroundf(t * 10.0f));
+    }
+    writeFrame(out, i, false);
+}
+
 // Upstream's three CMD_GET_STATS layouts.
 static void stats(uint8_t type) {
     CompanionRadioStats rs;
@@ -491,6 +529,31 @@ static void handle(size_t len) {
         // There is never a path to reset, but the contact has to exist.
         if (len >= 1 + MC_PUB_KEY_SIZE && findContact(&cmd[1]) >= 0) writeOk();
         else writeErr(ERR_CODE_NOT_FOUND);
+        break;
+
+    case CMD_SET_ADVERT_LATLON: {
+        // Upstream's layout; the altitude that may follow at [9] is unused
+        // there too.
+        if (len < 9) { writeErr(ERR_CODE_ILLEGAL_ARG); break; }
+        int32_t lat = (int32_t)rdU32le(&cmd[1]);
+        int32_t lon = (int32_t)rdU32le(&cmd[5]);
+        if (lat > 90000000 || lat < -90000000 || lon > 180000000 || lon < -180000000) {
+            writeErr(ERR_CODE_ILLEGAL_ARG);
+            break;
+        }
+        // 0,0 is how upstream spells "no position", and what an app sends
+        // when the fields are cleared: hand the position back to the pager.
+        host.setPosition(lat != 0 || lon != 0, lat / 1e6, lon / 1e6);
+        writeOk();
+        break;
+    }
+
+    case CMD_SEND_TELEMETRY_REQ:
+        // Exactly four bytes asks for the pager's own. With a key after them
+        // it is a request to another node, which takes the direct messaging
+        // this firmware does not do - that falls through to the refusal.
+        if (len == 4) { selfTelemetry(); break; }
+        writeErr(ERR_CODE_UNSUPPORTED_CMD);
         break;
 
     case CMD_HAS_CONNECTION:

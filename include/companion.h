@@ -22,6 +22,9 @@
 //     the host's while USB is attached, so nothing here writes to flash.
 //   - the clock. The phone's time is real time, so it sets the pager's clock
 //     like #mesh does - and lets an indoor pager start advertising.
+//   - its position, typed into the app. Not a setting: the pager's position
+//     is runtime state it already learns, and this is one more source of it.
+//   - its own telemetry: battery voltage and the RP2040's temperature.
 //
 // And it refuses the rest with an error rather than pretending:
 //
@@ -65,6 +68,7 @@
 #define CMD_SET_ADVERT_NAME         8
 #define CMD_SYNC_NEXT_MESSAGE      10
 #define CMD_RESET_PATH             13
+#define CMD_SET_ADVERT_LATLON      14
 #define CMD_REMOVE_CONTACT         15
 #define CMD_REBOOT                 19
 #define CMD_GET_BATT_AND_STORAGE   20
@@ -75,6 +79,7 @@
 #define CMD_GET_CONTACT_BY_KEY     30
 #define CMD_GET_CHANNEL            31
 #define CMD_SET_CHANNEL            32
+#define CMD_SEND_TELEMETRY_REQ     39
 #define CMD_GET_CUSTOM_VARS        40
 #define CMD_GET_STATS              56
 #define CMD_GET_AUTOADD_CONFIG     59
@@ -104,6 +109,7 @@
 #define PUSH_CODE_ADVERT            0x80
 #define PUSH_CODE_MSG_WAITING       0x83
 #define PUSH_CODE_LOG_RX_DATA       0x88
+#define PUSH_CODE_TELEMETRY_RESPONSE 0x8B
 
 #define ERR_CODE_UNSUPPORTED_CMD    1
 #define ERR_CODE_NOT_FOUND          2
@@ -134,6 +140,8 @@ struct CompanionHost {
     bool     (*transmit)(const uint8_t *frame, size_t len); // on air; false if the radio refused
     bool     (*advert)(bool flood);                         // false when there is no clock to sign with
     bool     (*position)(double *lat, double *lon);         // false when the pager has none
+    void     (*setPosition)(bool set, double lat, double lon); // the app's; set=false withdraws it
+    float    (*mcuTempC)();                                 // NAN when there is no sensor
     uint16_t (*batteryMv)();
     void     (*radioStats)(CompanionRadioStats *s);
     void     (*reboot)();

@@ -130,10 +130,12 @@ static bool         toneOn        = false;
 
 static AlertIdle idleMode = IDLE_OFF;
 static uint8_t   idleR = 0, idleG = 0, idleB = 0;
+static bool      ledDark = false;
 
 // The three dice share one 470R resistor to +3V3 and light when driven LOW,
 // so every duty cycle is inverted and scaled by ledBrightness.
 static void ledWrite(uint8_t r, uint8_t g, uint8_t b) {
+    if (ledDark) r = g = b = 0;
     uint16_t scale = (uint16_t)conf.ledBrightness;
     analogWrite(PIN_LED_R, 255 - (uint8_t)((uint16_t)r * scale / 255));
     analogWrite(PIN_LED_G, 255 - (uint8_t)((uint16_t)g * scale / 255));
@@ -205,6 +207,14 @@ bool Alerts::alarming() {
 void Alerts::setIdle(AlertIdle mode, uint8_t r, uint8_t g, uint8_t b) {
     idleMode = mode;
     idleR = r; idleG = g; idleB = b;
+}
+
+void Alerts::setLedDark(bool dark) {
+    if (dark == ledDark) return;
+    ledDark = dark;
+    // Now, not at the next step: a pattern step can hold its colour for a
+    // while, and the idle code only writes when it runs.
+    if (dark && started) ledWrite(0, 0, 0);
 }
 
 void Alerts::service() {

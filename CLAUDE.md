@@ -79,14 +79,16 @@ writes only the sketch region and leaves the filesystem alone.
   `config.txt` belongs to the host while USB is attached, and a USB link is
   always attached, so a setting could only live in RAM until the next boot.
   An error is more honest than that. Do not "add" settings by writing to
-  FatFS from the firmware.
+  FatFS from the firmware. `SET_ADVERT_LATLON` is accepted because a
+  position is not a setting here: it is runtime state the pager already
+  learns, and the app is one more source of it.
 - **The debug log stops once an app has spoken**, until DTR drops. A
   client scans for `>` to find a frame, and `logf()` lines contain
   `<sender>` - one line of text desynchronises it.
 - **App mode is `Companion::active()`, and it switches the pager off.**
   While an app is attached `handleChannelText()` hands the message over and
   returns before the store, the alarm and the screen; the button only
-  answers `APP MODE`. It ends on DTR dropping - and on a pulled cable, which
+  answers `APP MODE`, and `sendAdvert()` skips its tick. It ends on DTR dropping - and on a pulled cable, which
   the RP2040 never reports as an unplug (VBUS detect is forced on). The idle
   bus reads as a suspend instead, `tud_ready()` goes false and so does
   `Serial`. Without that, a pager unplugged mid-session would leave the desk
@@ -164,7 +166,14 @@ break:
 - Position is the **centre of the Maidenhead square** of the strongest
   repeater heard in the last six hours - not the repeater's own coordinates.
   What the pager knows is "within earshot of that repeater", and a grid
-  centre says exactly that. `include/grid.h`, `recomputePosition()`.
+  centre says exactly that. `include/grid.h`, `learnPosition()`.
+- **Only zero-hop repeater adverts are measured.** RSSI is the last hop's,
+  so a re-flooded advert reports the relay's strength against the far
+  repeater's coordinates. A hotspot (`../meshcore-repeater`, `role=hotspot`)
+  advertises as `ADV_TYPE_REPEATER` and counts like one.
+- Three position sources are kept apart - the app's, `locator`'s and the
+  heard one - and `choosePosition()` takes the first that is set. Folding
+  them into one would leave the app's position behind after it was cleared.
 - The clock comes from `#mesh` (authoritative, minute-aligned) and, only to
   bootstrap, from a signed repeater advert. `PagerClock::seedFromAdvert()`
   refuses once the clock is set, so a replayed old advert cannot drag it

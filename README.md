@@ -56,7 +56,7 @@ Everything else is built from the same proven range.
 | Mailbox empty | Two falling notes, G4 then E4 | Amber |
 | Message deleted | 880 Hz falling to 330 - the fetch sound backwards | Fading red |
 | Button registered | One 880 Hz click | Green blink |
-| Advert transmitted | One C6 tick | White |
+| Advert transmitted | One C6 tick (none in app mode) | White |
 | Something is wrong | A low, rough warble, twice | Red |
 
 Between patterns the LED reports state, and keeps doing it after the screen
@@ -66,7 +66,7 @@ glance at:
 | LED | Meaning |
 |---|---|
 | Red, breathing | The radio did not start |
-| Purple blip | App mode: a MeshCore app is attached |
+| Purple blip | App mode: a MeshCore app is attached. Dark once the screen sleeps. |
 | Blue, breathing | A fetch is out, waiting for the reply |
 | Orange blip | Unread messages |
 | Amber, breathing | Charging |
@@ -109,7 +109,7 @@ keep it, so an old `config.txt` on a deployed pager still boots.
 | `advertInterval` | `3600` | Seconds between self-adverts. |
 | `timeSyncInterval` | `21600` | Seconds between clock resyncs once the clock is set. |
 | `screenTimeout` | `30` | Seconds of no button before the display sleeps. `0` never sleeps. |
-| `locator` | *(empty)* | A Maidenhead square to advertise, e.g. `JO20EU`. Setting it stops the pager learning one. |
+| `locator` | *(empty)* | A Maidenhead square to advertise, e.g. `JO20EU`. Wins over what the pager hears; only a position from an app wins over it. |
 | `gridPrecision` | `6` | `4` or `6` characters when learning a locator. |
 | `frequency` `bandwidth` `sf` `cr` `preamble` | 434.890 / 62.5 / 8 / 8 / 16 | The IARU R1 ham MeshCore channel. |
 | `txPower` | `17` | dBm. The SX1276 produces 2-17 and a discrete 20; anything else rounds down. |
@@ -141,12 +141,14 @@ What the app gets:
 | Advert | The app's advert button, flood or zero-hop. Refused until the clock is set, like the schedule's. |
 | Packet log | Every packet the radio hears, raw, live. |
 | Statistics | Battery, uptime, noise floor, last RSSI/SNR, airtime and packet counts. |
+| Telemetry | Its own: battery voltage and the RP2040's temperature. |
+| Position | Type one into the app and the pager advertises it, as given, until it reboots or the app clears it. |
 
 What it refuses, with an error rather than a pretend success:
 
 - **Direct messages.** For the reason in
   [What it deliberately does not do](#what-it-deliberately-does-not-do).
-- **Settings** - name, position, radio, channels. `config.txt` is the
+- **Settings** - name, radio, channels. `config.txt` is the
   configuration, and the drive it lives on belongs to the computer or phone
   for as long as USB is attached, which for a USB link is always. Edit
   `config.txt` instead; the app shows the channels from it in the order
@@ -161,13 +163,15 @@ the interface then, and the pager steps aside:
 - Messages go to the app and nowhere else. The pager does not store them,
   alarm or chirp, so nothing heard in app mode is on the pager afterwards.
   What it had stored before is left alone, unread ones included.
-- The screen says `APP MODE`, and the LED blips purple.
+- The screen says `APP MODE`, and the LED blips purple. When the screen
+  sleeps the LED goes dark with it - a desk radio has no reason to blink.
 - The button does nothing but say `APP MODE - USE THE APP`. No scrolling, no
   fetch, no delete. An alarm that was sounding when the app attached stops,
   and a fetch that was out is forgotten - its reply reaches the app on
   `#mbox`.
 - What keeps the pager on the mesh carries on: adverts, the clock from
-  `#mesh`, and learning its position.
+  `#mesh`, and learning its position. Adverts go out without their tick;
+  the only sound left is the button's answer.
 
 When the app lets go the screen says `PAGER MODE` and everything is as it
 was. With `debug=true` the serial log is quiet for the same span - text in
@@ -175,17 +179,29 @@ the middle of the app's frames would break them.
 
 ## How it knows where it is
 
-It has no GPS. It listens for repeater adverts, takes the position of the
-strongest repeater it has heard in the last six hours, converts that to a
-Maidenhead square, and advertises the **centre of the square** - about 5 km
-across at 6 characters.
+It has no GPS. It listens for repeater adverts - a hotspot advertises as a
+repeater, so those count too - takes the position of the strongest one it
+has heard in the last six hours, converts that to a Maidenhead square, and
+advertises the **centre of the square** - about 5 km across at 6
+characters.
 
-That is deliberate, and not a rounding error. What the pager actually knows
-is "somewhere within earshot of that repeater". A grid centre says exactly
-that; copying the repeater's own coordinates would claim to be standing on
-its mast.
+Only adverts heard straight from the repeater count. One that another
+repeater has passed on arrives at the strength of the repeater that passed
+it on, which may be next door while the advert's sender is 100 km away.
 
-Set `locator` if you would rather say where you are yourself.
+The grid centre is deliberate, and not a rounding error. What the pager
+actually knows is "somewhere within earshot of that repeater". A grid
+centre says exactly that; copying the repeater's own coordinates would
+claim to be standing on its mast.
+
+Two things outrank what it hears:
+
+1. **A position typed into a MeshCore app** on USB. It is advertised as
+   given, not snapped to a square - whoever typed it knows where the pager
+   is. It lasts until the pager reboots, or until the app clears it, which
+   hands the position back to the next source down.
+2. **`locator` in `config.txt`**, if you would rather say where you are
+   yourself.
 
 ## How it knows the time
 

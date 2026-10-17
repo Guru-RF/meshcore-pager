@@ -268,7 +268,7 @@ static void drawStatus(const UiModel &m) {
 
     if (m.locator[0])
         snprintf(buf, sizeof(buf), "%s %s", m.locator,
-                 m.locatorFromConfig ? "(set)" : "(heard)");
+                 m.posSource == POS_APP ? "(app)" : m.posSource == POS_CONFIG ? "(set)" : "(heard)");
     else
         snprintf(buf, sizeof(buf), "no position yet");
     oled.drawStr(0, 27, buf);

@@ -96,7 +96,18 @@ struct HeardRepeater {
 };
 static HeardRepeater repeaters[8];
 
-static double myLat = 0.0, myLon = 0.0;
+// Where the pager says it is. Three sources, best first: an app that has
+// been told, the locator in config.txt, and the strongest repeater heard.
+// Each is kept apart, so withdrawing one falls back to the next rather than
+// to nothing - or to a stale copy of the one withdrawn.
+struct Fix {
+    bool   valid;
+    double lat, lon;
+    char   loc[8];
+};
+static Fix appFix, cfgFix, heardFix;
+
+static double myLat = 0.0, myLon = 0.0;     // the chosen one, as advertised
 static bool   haveLocation = false;
 
 // ---- small helpers ----
@@ -192,7 +203,9 @@ static bool sendAdvert(int route = -1) {
                               PagerClock::now());
     if (n < 0) return false;
     if (route >= 0) frame[0] = (uint8_t)((frame[0] & ~PH_ROUTE_MASK) | route);
-    Alerts::play(ALERT_TX);
+    // Not in app mode: the advert still goes out, but a tick every hour from
+    // a radio on a desk is noise, and the app shows the advert anyway.
+    if (!Companion::active()) Alerts::play(ALERT_TX);
     if (!sendFrame(frame, n)) return false;
     ui.adverts++;
     logf("advert sent (%d bytes)%s", n, haveLocation ? " with position" : "");
@@ -201,14 +214,33 @@ static bool sendAdvert(int route = -1) {
 
 // ---- position ----
 
-// Adopt the position of the strongest repeater heard in the last six hours,
-// then throw the precision away: what the pager actually knows is "within
-// earshot of that repeater", and the centre of its Maidenhead square says
-// exactly that. Copying the repeater's own coordinates would claim to be
-// standing on its mast.
-static void recomputePosition() {
-    if (cfg.locator[0]) return;              // pinned by config; nothing to learn
+static void choosePosition() {
+    const Fix *f   = nullptr;
+    PosSource  src = POS_NONE;
+    if (appFix.valid)        { f = &appFix;   src = POS_APP; }
+    else if (cfgFix.valid)   { f = &cfgFix;   src = POS_CONFIG; }
+    else if (heardFix.valid) { f = &heardFix; src = POS_HEARD; }
 
+    haveLocation = (f != nullptr);
+    if (f) { myLat = f->lat; myLon = f->lon; }
+
+    const char *loc = f ? f->loc : "";
+    if (src != ui.posSource || strcmp(loc, ui.locator) != 0) {
+        snprintf(ui.locator, sizeof(ui.locator), "%s", loc);
+        ui.posSource = src;
+        static const char *const from[] = {"", "repeater", "config.txt", "app"};
+        if (f) logf("position: %s (%.4f, %.4f) from %s", loc, myLat, myLon, from[src]);
+        else   logf("position: none");
+        uiDirty = true;
+    }
+}
+
+// The strongest repeater heard in the last six hours, with the precision
+// thrown away: what the pager actually knows is "within earshot of that
+// repeater", and the centre of its Maidenhead square says exactly that.
+// Copying the repeater's own coordinates would claim to be standing on its
+// mast.
+static void learnPosition() {
     int best = -1;
     uint32_t now = millis();
     for (int i = 0; i < (int)(sizeof(repeaters) / sizeof(repeaters[0])); i++) {
@@ -218,18 +250,13 @@ static void recomputePosition() {
     }
     if (best < 0) return;
 
-    char loc[8];
+    Fix f;
     if (!gridSnap(repeaters[best].lat, repeaters[best].lon, cfg.gridPrecision,
-                  &myLat, &myLon, loc))
+                  &f.lat, &f.lon, f.loc))
         return;
-
-    if (strcmp(loc, ui.locator) != 0) {
-        snprintf(ui.locator, sizeof(ui.locator), "%s", loc);
-        logf("position: %s (%.4f, %.4f) from repeater %d dBm",
-             loc, myLat, myLon, repeaters[best].rssi);
-        uiDirty = true;
-    }
-    haveLocation = true;
+    f.valid  = true;
+    heardFix = f;
+    choosePosition();
 }
 
 static void recordRepeater(const uint8_t *pub, int16_t rssi, double lat, double lon) {
@@ -384,14 +411,20 @@ static void handleAdvert(const MeshPacket &p) {
     Companion::onAdvert(pub, type, name, hasLoc, lat, lon, ts);
 
     // Only a repeater's clock is worth borrowing: it is the class of node
-    // that has one. And only until #mesh answers - see pagerclock.h.
+    // that has one. And only until #mesh answers - see pagerclock.h. A
+    // hotspot advertises as a repeater too, so it counts for both.
     if (type == ADV_TYPE_REPEATER) {
         bool wasValid = PagerClock::valid();
         PagerClock::seedFromAdvert(ts);
         if (!wasValid && PagerClock::valid()) { toast("CLOCK SET"); uiDirty = true; }
-        if (hasLoc) {
+
+        // Only an advert heard straight from the repeater says how strong
+        // that repeater is here. A re-flooded copy arrives at the strength
+        // of whichever repeater passed it on - perhaps the one next door,
+        // carrying the advert of one 100 km away.
+        if (hasLoc && Mesh::pathHashCount(p) == 0) {
             recordRepeater(pub, p.rssi, lat, lon);
-            recomputePosition();
+            learnPosition();
         }
     }
 }
@@ -700,6 +733,10 @@ static void serviceBattery() {
 // The LED is the only thing still reporting once the screen has slept, which
 // is what makes a screen timeout acceptable on a device you glance at.
 static void serviceIdleLed() {
+    // In app mode the pager is a radio on a desk, and a blinking one in a
+    // dark room is a nuisance. Dark whenever the screen is.
+    Alerts::setLedDark(Companion::active() && !Ui::awake());
+
     if (!Radio::ok())                  Alerts::setIdle(IDLE_BREATHE, 255,   0,   0);
     else if (Companion::active())      Alerts::setIdle(IDLE_PULSE,   160,   0, 255);
     else if (fetchPending)             Alerts::setIdle(IDLE_BREATHE,   0,  80, 255);
@@ -825,13 +862,13 @@ void setup() {
     if (!Radio::begin(cfg, err, sizeof(err))) fatal(err);
     watchdog_update();
 
-    // A locator in config.txt pins the position and stops the pager learning
-    // one from the repeaters it hears.
-    if (cfg.locator[0] && gridCentre(cfg.locator, &myLat, &myLon)) {
-        haveLocation = true;
-        ui.locatorFromConfig = true;
-        snprintf(ui.locator, sizeof(ui.locator), "%s", cfg.locator);
+    // A locator in config.txt outranks the repeaters the pager hears; only
+    // an app that says otherwise outranks it.
+    if (cfg.locator[0] && gridCentre(cfg.locator, &cfgFix.lat, &cfgFix.lon)) {
+        cfgFix.valid = true;
+        snprintf(cfgFix.loc, sizeof(cfgFix.loc), "%s", cfg.locator);
     }
+    choosePosition();
 
     CompanionHost host;
     host.cfg       = &cfg;
@@ -852,6 +889,18 @@ void setup() {
         *lon = myLon;
         return true;
     };
+    // Typed into the app, so taken as given rather than snapped to a grid
+    // square: the person holding the pager knows where it is.
+    host.setPosition = [](bool set, double lat, double lon) {
+        appFix.valid = set;
+        if (set) {
+            appFix.lat = lat;
+            appFix.lon = lon;
+            gridFromLatLon(lat, lon, appFix.loc, 6);
+        }
+        choosePosition();
+    };
+    host.mcuTempC  = []() { return analogReadTemp(); };
     host.batteryMv = []() { return (uint16_t)lroundf(battFilt * 1000.0f); };
     host.radioStats = [](CompanionRadioStats *s) {
         s->noiseFloor = Radio::noiseFloor();

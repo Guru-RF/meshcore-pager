@@ -20,6 +20,9 @@
 #include <Arduino.h>
 #include "config_file.h"
 
+// Where the position shown came from - see choosePosition() in main.cpp.
+enum PosSource { POS_NONE = 0, POS_HEARD, POS_CONFIG, POS_APP };
+
 enum UiView {
     VIEW_BOOT = 0,      // splash and setup progress
     VIEW_MESSAGE,       // a message, or the empty-store screen
@@ -49,7 +52,7 @@ struct UiModel {
     bool     identityOk;
     int      repeaters;         // distinct repeaters heard since boot
     char     locator[8];        // "" until one is learned or configured
-    bool     locatorFromConfig;
+    PosSource posSource;
 
     bool     holdIsFetch;       // what a long press would do right now
     uint32_t fetchStartedMs;    // 0 = no fetch outstanding

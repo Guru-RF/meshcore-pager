@@ -57,6 +57,10 @@ bool alarming();
 
 void setIdle(AlertIdle mode, uint8_t r, uint8_t g, uint8_t b);
 
+// Keep the LED off, patterns and idle alike, while `dark` holds. The buzzer
+// is not affected.
+void setLedDark(bool dark);
+
 // Call every loop pass.
 void service();
 

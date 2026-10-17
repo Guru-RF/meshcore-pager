@@ -21,8 +21,10 @@
 static inline void gridFromLatLon(double lat, double lon, char *out, int precision) {
     double alon = lon + 180.0;
     double alat = lat + 90.0;
-    if (alon < 0) alon = 0; if (alon >= 360.0) alon = 359.999999;
-    if (alat < 0) alat = 0; if (alat >= 180.0) alat = 179.999999;
+    if (alon < 0) alon = 0;
+    if (alon >= 360.0) alon = 359.999999;
+    if (alat < 0) alat = 0;
+    if (alat >= 180.0) alat = 179.999999;
 
     int fieldLon = (int)(alon / 20.0);
     int fieldLat = (int)(alat / 10.0);

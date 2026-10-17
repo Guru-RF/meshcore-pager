@@ -592,6 +592,14 @@ static void     fakeRadioStats(CompanionRadioStats *s) {
     s->recvFlood = 380; s->recvDirect = 30; s->sentFlood = 11; s->sentDirect = 1;
 }
 static void     fakeReboot() { rebooted = true; }
+static int      setPosCalls = 0;
+static bool     setPosSet   = false;
+static double   setPosLat = 0, setPosLon = 0;
+static void     fakeSetPosition(bool set, double lat, double lon) {
+    setPosCalls++; setPosSet = set; setPosLat = lat; setPosLon = lon;
+}
+static float    fakeTemp = 24.5f;
+static float    fakeMcuTemp() { return fakeTemp; }
 
 static void portClear() { portOutLen = portReadPos = 0; }
 
@@ -679,6 +687,8 @@ static void testCompanion() {
     host.transmit  = fakeTransmit;
     host.advert    = fakeAdvert;
     host.position  = fakePosition;
+    host.setPosition = fakeSetPosition;
+    host.mcuTempC  = fakeMcuTemp;
     host.batteryMv = fakeBattery;
     host.radioStats = fakeRadioStats;
     host.reboot    = fakeReboot;
@@ -991,6 +1001,47 @@ static void testCompanion() {
     uint8_t setname[] = {CMD_SET_ADVERT_NAME, 'X'};
     ck(appCall(setname, sizeof(setname), &r, &rn) && isErr(r, rn, ERR_CODE_UNSUPPORTED_CMD),
        "and the name");
+
+    // SET_ADVERT_LATLON: upstream's layout, micro-degrees, as Meshy sends it
+    // from its settings page - with the reserved altitude on the end.
+    uint8_t ll[13] = {CMD_SET_ADVERT_LATLON};
+    wr32(&ll[1], (uint32_t)50850000);
+    wr32(&ll[5], (uint32_t)(int32_t)4351000);
+    wr32(&ll[9], 0);
+    ck(appCall(ll, sizeof(ll), &r, &rn) && rn == 1 && r[0] == RESP_CODE_OK,
+       "SET_ADVERT_LATLON is OK - a position is not a setting");
+    ck(setPosCalls == 1 && setPosSet && fabs(setPosLat - 50.85) < 1e-9 && fabs(setPosLon - 4.351) < 1e-9,
+       "and hands the pager 50.850000, 4.351000");
+    wr32(&ll[5], (uint32_t)(int32_t)-4351000);
+    ck(appCall(ll, 9, &r, &rn) && r[0] == RESP_CODE_OK && fabs(setPosLon + 4.351) < 1e-9,
+       "west is negative, and the altitude is optional");
+    wr32(&ll[1], 0); wr32(&ll[5], 0);
+    ck(appCall(ll, 9, &r, &rn) && r[0] == RESP_CODE_OK && setPosCalls == 3 && !setPosSet,
+       "0,0 withdraws it, as upstream reads 0,0 as no position");
+    wr32(&ll[1], (uint32_t)91000000);
+    ck(appCall(ll, 9, &r, &rn) && isErr(r, rn, ERR_CODE_ILLEGAL_ARG) && setPosCalls == 3,
+       "a latitude past the pole is refused and changes nothing");
+    ck(appCall(ll, 5, &r, &rn) && isErr(r, rn, ERR_CODE_ILLEGAL_ARG), "so is a short frame");
+
+    // Self telemetry, as Meshy's device page asks for it: four bytes, no key.
+    // The reply is a push code, and Cayenne LPP after an 8-byte header.
+    uint8_t tr[4] = {CMD_SEND_TELEMETRY_REQ, 0, 0, 0};
+    ck(appCall(tr, sizeof(tr), &r, &rn) && r[0] == PUSH_CODE_TELEMETRY_RESPONSE && r[1] == 0,
+       "SEND_TELEMETRY_REQ for ourselves gets TELEMETRY_RESPONSE");
+    ck(memcmp(&r[2], Mesh::publicKey(), 6) == 0, "our key prefix at [2]");
+    ck(rn == 16 && r[8] == 1 && r[9] == 116 && ((r[10] << 8) | r[11]) == 391,
+       "channel 1 voltage: 3912 mV as 391 hundredths, big-endian");
+    ck(r[12] == 1 && r[13] == 103 && (int16_t)((r[14] << 8) | r[15]) == 245,
+       "channel 1 temperature: 24.5 C as 245 tenths");
+    fakeTemp = -3.2f;
+    ck(appCall(tr, sizeof(tr), &r, &rn) && rn == 16 && (int16_t)((r[14] << 8) | r[15]) == -32,
+       "below zero is signed");
+    fakeTemp = NAN;
+    ck(appCall(tr, sizeof(tr), &r, &rn) && rn == 12, "no sensor, no temperature - just the battery");
+    uint8_t trk[4 + MC_PUB_KEY_SIZE] = {CMD_SEND_TELEMETRY_REQ, 0, 0, 0};
+    ck(appCall(trk, sizeof(trk), &r, &rn) && isErr(r, rn, ERR_CODE_UNSUPPORTED_CMD),
+       "telemetry from another node needs direct messaging, and is refused");
+
     uint8_t key[] = {CMD_EXPORT_PRIVATE_KEY};
     ck(appCall(key, 1, &r, &rn) && rn == 1 && r[0] == RESP_CODE_DISABLED, "the private key does not leave");
 
