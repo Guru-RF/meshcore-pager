@@ -27,12 +27,33 @@ One button. What it does depends on what is on screen.
 | Press | Next message. One press past the oldest lands on the status page, then it wraps. |
 | Hold (0.7 s), more than `fetchCooldown` since the last fetch | Fetch your mail from `#mbox`. |
 | Hold (0.7 s), within `fetchCooldown` of the last fetch | Delete the message on screen. |
+| Hold (3 s) | Suspend - see below. |
+| Hold (0.7 s), while suspended | Wake up. |
 | Press or hold, while an app is attached | Nothing but `APP MODE - USE THE APP` - see [With a MeshCore app](#with-a-meshcore-app). |
+
+A hold clicks as it passes 0.7 s and says what letting go will do -
+`RELEASE: FETCH` or `RELEASE: DELETE` - and plays the suspend tune as it
+passes 3 s, `RELEASE: SUSPEND`. Nothing happens until you let go, so a hold on
+its way to suspend does not fetch or delete as it passes.
 
 The bottom right of the screen always says which of the two a hold will do -
 `HOLD:FETCH` or `HOLD:DEL` - so you never have to remember how long ago you
 last fetched. The default `fetchCooldown` is 600 seconds: fetch, then for ten
 minutes the button is a delete key, then it is a fetch key again.
+
+### Suspend
+
+Suspended, the pager is as good as off: the radio sleeps, the screen and the
+LED are dark, and nothing is sent or heard. The messages already on it stay.
+A short press does nothing; hold the button 0.7 s and it wakes with the
+startup tune and `AWAKE`.
+
+On battery the RP2040 goes dormant, with both of its clocks stopped, and the
+pager draws a small fraction of what it does listening. A pager whose clock
+stops loses the time: it wakes with no clock and asks `#mesh` again, as at
+power-on, and does not advertise until it has one. On a computer's USB port
+it stays awake instead, so the drive and the serial port do not disappear
+from the computer, and keeps the time.
 
 There is no separate acknowledge. Deleting a message *is* acknowledging it,
 and silencing the alarm marks it read. MeshCore has no acknowledgement for a
@@ -58,6 +79,7 @@ Everything else is built from the same proven range.
 | Button registered | One 880 Hz click | Green blink |
 | Advert transmitted | One C6 tick (none in app mode) | White |
 | Something is wrong | A low, rough warble, twice | Red |
+| Suspending | C G F E, the startup tune backwards | White, blue, green, red |
 
 Between patterns the LED reports state, and keeps doing it after the screen
 has slept - which is what makes a screen timeout acceptable on a device you
@@ -69,9 +91,42 @@ glance at:
 | Purple blip | App mode: a MeshCore app is attached. Dark once the screen sleeps. |
 | Blue, breathing | A fetch is out, waiting for the reply |
 | Orange blip | Unread messages |
-| Amber, breathing | Charging |
+| Amber, breathing | On USB, charging |
+| Green, breathing | On USB, charged |
 | Yellow blip | No clock yet, so it is not advertising |
 | Green blip | Idle and healthy |
+
+### Power
+
+The top right of the screen says what the pager is running on, and the
+status page gives the voltage with it:
+
+| Top right | Status page | LED, when idle | Meaning |
+|---|---|---|---|
+| A battery, filled to its level | `3.95V 75% battery` | as above | On battery |
+| `USB 84%` | `4.01V 84% charging` | Amber, breathing | On USB, charging |
+| `USB 100%` | `4.19V 100% charged` | Green, breathing | On USB, full |
+
+Plugging in or out wakes the screen and says `CHARGING`, `ON USB` or
+`ON BATTERY`, and `CHARGED` when charging finishes - except in app mode,
+where the screen is the app's. On USB the percentage reads high - the
+charger lifts the battery's voltage - so take it as how far along, not as
+the charge it will hold.
+
+How much of that it knows depends on the board. A **reworked** board (R21
+removed, D5 bridged, and a 100k/150k divider from VCCFILTER to GP24 - see
+[docs/hardware.md](docs/hardware.md)) reads both USB power and the
+charger's own status, on any charger. Plugging a full battery in still
+shows `CHARGING` for up to a minute while the charger checks it. The
+**original** board can see neither: it takes USB power from a computer
+answering on the cable, so on a plain charger or a sleeping computer it
+charges but shows the battery icon, and it judges "full" from the voltage.
+The pager tells the two apart by itself at boot, and says which it found on
+the serial log.
+
+Below about 3.45 V it reads 0%. The voltage reading cannot go lower: the
+regulator that makes 3.3 V is also the ADC's reference, and once the battery
+gets that low the reference sinks with it.
 
 ## Setting it up
 

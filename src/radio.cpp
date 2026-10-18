@@ -107,6 +107,11 @@ void Radio::listen() {
     radio.startReceive();
 }
 
+void Radio::sleep() {
+    if (!started) return;
+    radio.sleep();
+}
+
 uint32_t Radio::timeOnAirMs(size_t len) {
     if (!started) return 0;
     return (uint32_t)(radio.getTimeOnAir(len) / 1000);

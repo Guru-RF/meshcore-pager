@@ -99,6 +99,15 @@ static const AlertStep P_ERROR[] = {
     {  0,   0, 0,  80,   0, 0, 0},
 };
 
+// The boot tune backwards, LED and all.
+static const AlertStep P_SUSPEND[] = {
+    {523, 0, 0, 120, 120, 120, 160},
+    {392, 0, 0, 120,   0,   0, 160},
+    {349, 0, 0, 120,   0, 120,   0},
+    {330, 0, 0, 260, 120,   0,   0},
+    {  0, 0, 0,  80,   0,   0,   0},
+};
+
 struct PatternDef { const AlertStep *s; uint8_t n; };
 
 static const PatternDef PATTERNS[] = {
@@ -113,6 +122,7 @@ static const PatternDef PATTERNS[] = {
     {P_ACK,        sizeof(P_ACK)        / sizeof(AlertStep)},
     {P_TX,         sizeof(P_TX)         / sizeof(AlertStep)},
     {P_ERROR,      sizeof(P_ERROR)      / sizeof(AlertStep)},
+    {P_SUSPEND,    sizeof(P_SUSPEND)    / sizeof(AlertStep)},
 };
 
 // ---- state ----
@@ -202,6 +212,10 @@ void Alerts::stop() {
 
 bool Alerts::alarming() {
     return current != ALERT_NONE && repeatUntilMs != 0;
+}
+
+bool Alerts::playing() {
+    return current != ALERT_NONE;
 }
 
 void Alerts::setIdle(AlertIdle mode, uint8_t r, uint8_t g, uint8_t b) {

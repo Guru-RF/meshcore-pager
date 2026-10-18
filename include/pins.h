@@ -72,11 +72,16 @@
 #define PIN_VBAT_ADC    27      // ADC1
 #define VBAT_DIVIDER    2.0f
 
-// BQ21040 CHG# reaches the RP2040 through R21 (330R) from the USB rail with
-// D5, a 3V3 zener, clamping the pad. It reads HIGH while the charger is
-// pulling CHG# down - that is, while USB is present and the cell is being
-// charged. Off charge the pad is floating, so it needs the internal
-// PULL-DOWN to read LOW; the previous firmware set Pull.DOWN here too. It is
-// a charger-active indication and not a state of charge - the percentage on
-// screen comes from the ADC.
+// The BQ21040's CHG#, and two boards to tell apart (docs/hardware.md):
+//
+//   reworked  R21 removed, D5 bridged: GP13 is CHG# itself. Open-drain, so
+//             it needs the internal pull-up, and reads LOW while charging.
+//   original  R21 (330R) from the cell to GP13, D5 (3V3 zener, cathode to
+//             GP13) to CHG#. It reads HIGH whenever a cell is fitted,
+//             charging or not, and is not read.
 #define PIN_CHARGE      13
+
+// Reworked boards only: VCCFILTER -> 100k -> GP24 -> 150k -> GND, so it reads
+// HIGH (3.0 V from 5 V) while USB power is present. Floating on the original
+// board, which is how the firmware tells the two apart - probePowerSense().
+#define PIN_VBUS        24

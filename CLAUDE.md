@@ -58,10 +58,11 @@ writes only the sketch region and leaves the filesystem alone.
 - **The buzzer frequencies in `src/alerts.cpp` are not tuning choices.** They
   come from `LoRa433APRSpager`'s `code.py`, which ran on this board: 330 Hz
   to 1165 Hz, 50% duty. Do not "correct" them towards a package resonance -
-  an earlier draft of this firmware assumed 2.7 kHz and was wrong. Four other
+  an earlier draft of this firmware assumed 2.7 kHz and was wrong. Other
   facts come from the same source and are listed in docs/hardware.md: the
-  display is mounted upside down (hence `U8G2_R2`), GP13 needs a pull-down,
-  and the LED order is R/G/B on GP7/8/9.
+  display is mounted upside down (hence `U8G2_R2`) and the LED order is
+  R/G/B on GP7/8/9. Its pull-down on GP13 is the one thing the schematic
+  overrules.
 - **Receive is polled** because no DIO line is routed on this board.
   Continuous-mode RxDone latches, so a late poll still finds the packet; what
   a late poll costs is the *second* packet of a back-to-back pair.
@@ -93,6 +94,18 @@ writes only the sketch region and leaves the filesystem alone.
   bus reads as a suspend instead, `tud_ready()` goes false and so does
   `Serial`. Without that, a pager unplugged mid-session would leave the desk
   never to alarm again.
+- **Two boards, told apart at boot.** The original's GP13 reads HIGH
+  whenever a cell is fitted (R21 to the cell, D5 to CHG#), and it has no
+  VBUS sense, so USB is `tud_ready()` and "full" is the voltage. A reworked
+  board has CHG# straight on GP13 and a 100k/150k VCCFILTER divider on
+  GP24. `probePowerSense()` drives GP24 and lets go: a floating pad keeps
+  the level, the divider does not. Do not put a pull on GP24 on a reworked
+  board - beside the 150k it drags 3.0 V to about 1.5 V. `readPower()`,
+  docs/hardware.md.
+- **The battery reading floors at about 3.4 V.** ADC_AVDD is the LDO's
+  3V3, which follows the cell down once it is within dropout, so the ratio
+  stops moving. `battPercent()` ends at 3.45 V for that reason; do not
+  extend the curve below it.
 - **USB serial writes go nowhere while DTR is low.** That is this core's
   `SerialUSB`, and upstream's RP2040 companions run on the same core, so
   every app already asserts DTR. The flip side is that a push to an app that
@@ -147,7 +160,7 @@ which vendored it from the repeater, so the three cannot drift.
 
 ## The one-button interface
 
-The whole state machine is in `src/main.cpp`. Three details are easy to
+The whole state machine is in `src/main.cpp`. Four details are easy to
 break:
 
 - **The alarm stops on the way DOWN, not on release** (`onPressStart`), so
@@ -160,6 +173,32 @@ break:
   press past the oldest message reaches it without needing a second gesture.
   Anything that changes the message count has to keep `sel` inside
   `0..count`.
+- **A hold acts on release; its thresholds are only announced.** A hold
+  passes 0.7 s (fetch or delete) on its way to 3 s (suspend), so acting at
+  0.7 s would fetch or delete on the way to suspending. The click and the
+  `RELEASE:` toast at each threshold are what says it registered.
+
+## Suspend
+
+- **Dormant stops `millis()`.** The timer runs off clk_ref, which stops with
+  the oscillators, so `PagerClock` comes back behind by however long the
+  pager slept. `resume()` calls `PagerClock::forget()` and the clock is
+  fetched again as at boot - an advert stamped with the stale time is what
+  the clock gate exists to prevent. Light suspend (a host on USB) keeps
+  `millis()` running and keeps the clock.
+- **The SDK wakes into its own clocks, not this core's.**
+  `low_power_dormant_until_gpio_pin_state()` ends in `runtime_init_clocks()`
+  (125 MHz); the core's `main()` then set F_CPU, and the radio's SPI and the
+  LED PWM dividers were computed against that. `sleepUntilButton()` repeats
+  the `set_sys_clock_khz()`.
+- **`USB.mutex` is held across the dormant call.** The SDK `tud_deinit()`s
+  before stopping the clocks and `tud_init()`s after, and the core's 1 ms
+  USB task would otherwise run `tud_task()` in the middle of either. The
+  SDK's `stdio_flush()` is the core's `Serial.flush()`, which sees the mutex
+  is this core's own and returns rather than deadlocking.
+- **Off is a constant level, so dormant cannot freeze an LED on.** PWM stops
+  mid-cycle with the clocks, but `analogWrite(255)` is above the wrap and
+  never goes low, and `noTone()` parks the buzzer pin low.
 
 ## Position and clock
 

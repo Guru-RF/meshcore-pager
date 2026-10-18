@@ -130,22 +130,27 @@ static int wrapText(const char *s, int maxPx, char lines[][40], int maxLines, in
 
 // ---- chrome ----
 
-static void drawBattery(int x, int y, int pct, bool charging) {
+static void drawBattery(int x, int y, int pct) {
     oled.drawFrame(x, y, 12, 7);
     oled.drawBox(x + 12, y + 2, 2, 3);            // the nub
     int fill = (pct * 10) / 100;
     if (fill > 10) fill = 10;
     if (fill < 0) fill = 0;
     if (fill) oled.drawBox(x + 1, y + 1, fill, 5);
-    if (charging) {
-        // A bolt across the cell, drawn in the inverse so it reads on top of
-        // whatever charge level is filled in behind it.
-        oled.setDrawColor(2);
-        oled.drawLine(x + 7, y + 1, x + 4, y + 4);
-        oled.drawLine(x + 4, y + 4, x + 7, y + 4);
-        oled.drawLine(x + 7, y + 4, x + 4, y + 6);
-        oled.setDrawColor(1);
+}
+
+// Right-aligned at the top right; returns the x it starts at. On battery, a
+// cell filled to its level; on USB, the word and the percentage.
+static int drawPower(const UiModel &m) {
+    if (m.power == PWR_BATTERY) {
+        drawBattery(W - 16, 1, m.battPct);
+        return W - 16;
     }
+    char buf[12];
+    snprintf(buf, sizeof(buf), "USB %d%%", m.battPct);
+    int x = W - oled.getStrWidth(buf);
+    oled.drawStr(x, 7, buf);
+    return x;
 }
 
 static void drawStatusBar(const UiModel &m) {
@@ -155,28 +160,43 @@ static void drawStatusBar(const UiModel &m) {
     fmtClock(m, buf, sizeof(buf));
     oled.drawStr(0, 7, buf);
 
-    // The call is the identity the alarm keys off, so it is always on screen -
-    // clipped to the gap before the badge rather than allowed to run under it.
-    char call[16];
-    snprintf(call, sizeof(call), "%s", m.cfg->call);
-    while (call[0] && oled.getStrWidth(call) > 62) call[strlen(call) - 1] = '\0';
-    oled.drawStr(32, 7, call);
+    // Laid out from the right, because the power reading changes width: the
+    // power, then the badge left of it, then the call in whatever is left.
+    int right = drawPower(m);
 
-    if (!m.radioOk)          oled.drawStr(96, 7, "RF!");
-    else if (!m.identityOk)  oled.drawStr(96, 7, "ID!");
+    const char *badge = nullptr;
+    bool boxed = false;
+    if (!m.radioOk)         badge = "RF!";
+    else if (!m.identityOk) badge = "ID!";
     else {
         int unread = Messages::unread();
         if (unread > 0) {
             snprintf(buf, sizeof(buf), "%d", unread > 99 ? 99 : unread);
-            int wpx = oled.getStrWidth(buf);
-            oled.drawBox(96 - 1, 0, wpx + 3, 9);
-            oled.setDrawColor(0);
-            oled.drawStr(96 + 1, 7, buf);
-            oled.setDrawColor(1);
+            badge = buf;
+            boxed = true;
         }
     }
+    if (badge) {
+        int wpx = oled.getStrWidth(badge);
+        int x = right - 3 - wpx;
+        if (boxed) {
+            oled.drawBox(x - 1, 0, wpx + 3, 9);
+            oled.setDrawColor(0);
+            oled.drawStr(x + 1, 7, badge);
+            oled.setDrawColor(1);
+        } else {
+            oled.drawStr(x, 7, badge);
+        }
+        right = x - 1;
+    }
 
-    drawBattery(112, 1, m.battPct, m.charging);
+    // The call is the identity the alarm keys off, so it is always on screen -
+    // clipped to the gap before the badge rather than allowed to run under it.
+    char call[16];
+    snprintf(call, sizeof(call), "%s", m.cfg->call);
+    while (call[0] && oled.getStrWidth(call) > right - 2 - 32) call[strlen(call) - 1] = '\0';
+    oled.drawStr(32, 7, call);
+
     oled.drawHLine(0, 9, W);
 }
 
@@ -285,8 +305,14 @@ static void drawStatus(const UiModel &m) {
     }
     oled.drawStr(0, 45, buf);
 
-    snprintf(buf, sizeof(buf), "%.2fV %d%%%s", (double)m.battVolts, m.battPct,
-             m.charging ? " chg" : "");
+    // On USB the charger lifts the voltage and the percentage reads high; it
+    // is shown anyway, as a rough "how far along".
+    if (m.power == PWR_CHARGING)
+        snprintf(buf, sizeof(buf), "%.2fV %d%% charging", (double)m.battVolts, m.battPct);
+    else if (m.power == PWR_FULL)
+        snprintf(buf, sizeof(buf), "%.2fV %d%% charged", (double)m.battVolts, m.battPct);
+    else
+        snprintf(buf, sizeof(buf), "%.2fV %d%% battery", (double)m.battVolts, m.battPct);
     oled.drawStr(0, 52, buf);
 }
 

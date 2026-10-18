@@ -12,6 +12,7 @@
 //            past the oldest lands on the status page)
 //   hold   - fetch mail from #mbox, or - within fetchCooldown of the last
 //            fetch - delete the message on screen
+//   3 s    - suspend: radio, screen and LED off until the next hold
 //
 // Everything the pager knows lives in the UiModel below and is drawn from
 // there, so the screen cannot disagree with the state that drives the LED.
@@ -25,7 +26,11 @@
 #include <Arduino.h>
 #include <FatFS.h>
 #include <FatFSUSB.h>
+#include <USB.h>
+#include <hardware/clocks.h>
 #include <hardware/watchdog.h>
+#include <pico/low_power.h>
+#include <tusb.h>
 
 #include "alerts.h"
 #include "companion.h"
@@ -73,6 +78,13 @@ static bool     uiDirty           = true;
 
 static uint32_t nextBattMs = 0;
 static float    battFilt   = 0.0f;
+static uint32_t lastTxMs   = 0;
+
+static bool        powerSense  = false;         // the reworked board's GP24 and GP13 - probePowerSense()
+static uint32_t    nextPowerMs = 0;
+static PowerSource powerSeen   = PWR_BATTERY;   // the latest reading, settled or not
+static int         powerSame   = 0;             // further polls it has held for
+static bool        powerKnown  = false;         // the first settled reading is not news
 
 static bool     portWasOpen = false;
 static bool     appWasActive = false;
@@ -152,10 +164,15 @@ static uint32_t mcTimestamp() {
 // LiPo, loaded, discharge curve flattened to eight points. A percentage off
 // a resting-voltage table is a guess under load; it is here to say "nearly
 // flat" rather than to be accurate in the middle.
+//
+// It ends at 3.45 V because the reading does. The ADC's reference is the 3V3
+// rail, and on battery that comes off the cell through an XC6206 LDO: once
+// the cell is within the LDO's dropout of 3.3 V the rail sinks with it, the
+// ratio stops changing, and a dying cell keeps reading about 3.4 V.
 static int battPercent(float v) {
     static const struct { float v; int pct; } curve[] = {
         {4.15f, 100}, {4.05f, 90}, {3.95f, 75}, {3.85f, 60},
-        {3.75f, 45},  {3.65f, 30}, {3.55f, 15}, {3.40f, 5}, {3.20f, 0},
+        {3.75f, 45},  {3.65f, 30}, {3.55f, 15}, {3.45f, 0},
     };
     if (v >= curve[0].v) return 100;
     for (unsigned i = 1; i < sizeof(curve) / sizeof(curve[0]); i++) {
@@ -177,6 +194,7 @@ static bool sendFrame(const uint8_t *frame, int len) {
     // as an incoming message.
     Mesh::rememberFrame(frame, (size_t)len);
     bool ok = Radio::send(frame, (size_t)len);
+    lastTxMs = millis();
     if (!ok) logf("tx failed (%d bytes)", len);
     else if (isFloodHeader(frame[0])) nSentFlood++;
     else nSentDirect++;
@@ -467,16 +485,28 @@ static void handlePacket(const uint8_t *raw, int len, int16_t rssi, int8_t snrQ)
 
 // ---- the button ----
 
-#define BTN_DEBOUNCE_MS  25
-#define BTN_LONG_MS     700
+#define BTN_DEBOUNCE_MS   25
+#define BTN_LONG_MS      700
+#define BTN_SUSPEND_MS  3000
 
-static bool     btnRaw        = false;
-static bool     btnStable     = false;
-static uint32_t btnChangeMs   = 0;
-static uint32_t btnDownMs     = 0;
-static bool     btnLongFired  = false;
-static bool     silencedByThisPress = false;
-static bool     wokeByThisPress     = false;
+// How far the current press has got. Each stage is announced as it passes,
+// with the button still down; what it does happens on the release.
+enum HoldStage {
+    HOLD_SHORT = 0,     // a press, so far
+    HOLD_LONG,          // past BTN_LONG_MS: fetch or delete
+    HOLD_SUSPEND,       // past BTN_SUSPEND_MS: suspend
+    HOLD_SPENT          // the press that woke the pager - its release does nothing
+};
+
+static bool      btnRaw      = false;
+static bool      btnStable   = false;
+static uint32_t  btnChangeMs = 0;
+static uint32_t  btnDownMs   = 0;
+static HoldStage btnHold     = HOLD_SHORT;
+static bool      silencedByThisPress = false;
+static bool      wokeByThisPress     = false;
+
+static bool      suspended   = false;
 
 static bool holdWouldFetch() {
     if (!everFetched) return true;
@@ -583,15 +613,38 @@ static void onShortPress() {
     uiDirty = true;
 }
 
-static void onLongPress() {
+// A toast that stays up until the release replaces it with what happened.
+static void toastHeld(const char *text) {
+    toast(text);
+    ui.toastUntilMs = millis() + 60000;
+}
+
+static void onLongReached() {
     if (Companion::active()) return;
+    Alerts::play(ALERT_ACK);
+    toastHeld(holdWouldFetch() ? "RELEASE: FETCH" : "RELEASE: DELETE");
+}
+
+static void onSuspendReached() {
+    if (Companion::active()) return;
+    Alerts::play(ALERT_SUSPEND);
+    toastHeld("RELEASE: SUSPEND");
+}
+
+static void enterSuspend();
+
+static void onRelease(HoldStage stage) {
+    if (stage == HOLD_SHORT) { onShortPress(); return; }
 
     // A hold is deliberate: it does what it says whether or not it also
     // silenced an alarm or woke the screen on the way down.
     silencedByThisPress = false;
     wokeByThisPress     = false;
-    if (holdWouldFetch()) doFetch();
-    else                  doDelete();
+    if (stage == HOLD_SPENT || Companion::active()) return;
+
+    if (stage == HOLD_SUSPEND) enterSuspend();
+    else if (holdWouldFetch()) doFetch();
+    else                       doDelete();
 }
 
 static void serviceButton() {
@@ -602,20 +655,115 @@ static void serviceButton() {
     if ((now - btnChangeMs) >= BTN_DEBOUNCE_MS && raw != btnStable) {
         btnStable = raw;
         if (raw) {
-            btnDownMs    = now;
-            btnLongFired = false;
+            btnDownMs = now;
+            btnHold   = HOLD_SHORT;
             onPressStart();
-        } else if (!btnLongFired) {
-            onShortPress();
+        } else {
+            onRelease(btnHold);
         }
     }
 
-    // Fire the hold at the threshold rather than on release, so the pager
-    // answers while your thumb is still down and you know it registered.
-    if (btnStable && !btnLongFired && (now - btnDownMs) >= BTN_LONG_MS) {
-        btnLongFired = true;
-        onLongPress();
+    // Each threshold is announced as it passes, so the pager answers while
+    // your thumb is still down and you know what letting go will do. The
+    // doing waits for the release: a hold on its way to suspend must not
+    // fetch or delete as it goes by.
+    if (!btnStable) return;
+    if (btnHold == HOLD_SHORT && (now - btnDownMs) >= BTN_LONG_MS) {
+        btnHold = HOLD_LONG;
+        onLongReached();
+    } else if (btnHold == HOLD_LONG && (now - btnDownMs) >= BTN_SUSPEND_MS) {
+        btnHold = HOLD_SUSPEND;
+        onSuspendReached();
     }
+}
+
+// ---- suspend ----
+//
+// Off, short of pulling the cell: the radio asleep, the screen and the LED
+// dark, and nothing on air. Messages stay where they were. On battery the
+// RP2040 goes dormant - both oscillators stopped - until the button pulls
+// GP12 low; with a host on the USB port it stays up instead, so the drive and
+// the serial port do not vanish from under the host, and only waits.
+
+// The press that wakes it has to be a hold. True once the button has been
+// down for BTN_LONG_MS, false as soon as it has been up for a debounce.
+static bool heldToWake() {
+    uint32_t start = millis(), upAt = 0;
+    bool up = false;
+    while ((millis() - start) < BTN_LONG_MS) {
+        watchdog_update();
+        if (digitalRead(PIN_BUTTON) == LOW) up = false;
+        else if (!up)                       { up = true; upAt = millis(); }
+        else if ((millis() - upAt) >= BTN_DEBOUNCE_MS) return false;
+    }
+    return true;
+}
+
+static void enterSuspend() {
+    // Let the tune that announced it finish - unless an alarm has taken
+    // over since, which is stopped with everything else.
+    uint32_t until = millis() + 1000;
+    while (Alerts::playing() && !Alerts::alarming() && (int32_t)(millis() - until) < 0) {
+        Alerts::service();
+        watchdog_update();
+    }
+    // The buzzer pin low and the LED channels high hold through dormant, and
+    // Alerts::service() does not run again until the pager wakes.
+    Alerts::stop();
+    fetchPending = false;
+    ui.fetchStartedMs = 0;
+    Radio::sleep();
+    Ui::sleep();
+    logf("suspended");
+    suspended = true;
+}
+
+static void sleepUntilButton() {
+    // The SDK takes TinyUSB down before the clocks stop and brings it back
+    // after; the core's USB task must not run in the middle of either.
+    mutex_enter_blocking(&USB.mutex);
+    low_power_dormant_until_gpio_pin_state(PIN_BUTTON, false, false, DORMANT_CLOCK_SOURCE_XOSC, nullptr);
+    mutex_exit(&USB.mutex);
+#if F_CPU != 125000000
+    // It wakes into the SDK's default clocks. This core runs at F_CPU, and
+    // every divider set since boot - the radio's SPI, the LED PWM - assumes it, so
+    // finish the way the core's main() did.
+    set_sys_clock_khz(F_CPU / 1000, true);
+#endif
+}
+
+static void resume(bool clockStopped) {
+    suspended = false;
+    if (clockStopped) {
+        PagerClock::forget();
+        clockWasValid = false;
+        timeReqTries  = 0;
+        nextTimeReqMs = millis() + 10000;
+    }
+    Radio::listen();
+
+    // The press that woke it is still down, and letting go of it is not a
+    // short press.
+    btnRaw = btnStable = true;
+    btnChangeMs = btnDownMs = millis();
+    btnHold = HOLD_SPENT;
+
+    Ui::wake();
+    toast("AWAKE");
+    Alerts::play(ALERT_BOOT);
+    lastInteractionMs = millis();
+    uiDirty = true;
+    logf("awake%s", clockStopped ? ", clock lost while dormant" : "");
+}
+
+static void serviceSuspended() {
+    if (tud_ready()) {
+        if (digitalRead(PIN_BUTTON) == LOW && heldToWake()) resume(false);
+        else delay(10);
+        return;
+    }
+    sleepUntilButton();
+    if (heldToWake()) resume(true);
 }
 
 // ---- schedulers ----
@@ -717,17 +865,108 @@ static void serviceCompanion() {
     }
 }
 
+// The RP2040's ADC is noisy, and the divider is 50k behind 200 nF, so one
+// sample is a poor reading: average a burst. Not just after a transmission
+// either - the cell sags under the radio, and the divider node takes tens of
+// milliseconds to follow it back up.
 static void serviceBattery() {
     if ((int32_t)(millis() - nextBattMs) < 0) return;
+    if (lastTxMs && (millis() - lastTxMs) < 200) return;
     nextBattMs = millis() + 5000;
 
-    float v = analogRead(PIN_VBAT_ADC) * (3.3f / 4095.0f) * VBAT_DIVIDER;
+    uint32_t sum = 0;
+    for (int i = 0; i < 32; i++) sum += analogRead(PIN_VBAT_ADC);
+    float v = (sum / 32.0f) * (3.3f / 4095.0f) * VBAT_DIVIDER;
     battFilt = (battFilt == 0.0f) ? v : (battFilt * 0.8f + v * 0.2f);
 
     ui.battVolts = battFilt;
     ui.battPct   = battPercent(battFilt);
-    ui.charging  = (digitalRead(PIN_CHARGE) == HIGH);
     uiDirty = true;
+}
+
+// The reworked board has a divider on GP24 (VCCFILTER -> 100k -> GP24 ->
+// 150k -> GND); the original has nothing there. The divider is 60k, close
+// enough to the internal pulls (50-80k) that a pull test lands mid-rail, so
+// instead: drive the pin, let go, and look. A floating pad keeps what it was
+// last driven to for milliseconds; one on the divider has followed it again
+// within a microsecond. Driven each way, a floating pad reads back both ways
+// and a divided one reads the same twice - LOW off USB, HIGH on it.
+// `trace` gets what each round read back, driven low then high ("LH" is
+// floating), for the boot log: a rework that is not seen has to be
+// diagnosable without a scope.
+static char probeTrace[8];
+
+static bool probePowerSense() {
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        int back[2];
+        for (int level = 0; level < 2; level++) {
+            pinMode(PIN_VBUS, OUTPUT);
+            digitalWrite(PIN_VBUS, level ? HIGH : LOW);
+            delayMicroseconds(20);
+            pinMode(PIN_VBUS, INPUT);
+            delayMicroseconds(50);
+            back[level] = digitalRead(PIN_VBUS);
+            probeTrace[n++] = back[level] ? 'H' : 'L';
+        }
+        probeTrace[n] = '\0';
+        if (back[0] != back[1]) return false;   // it kept what it was given
+    }
+    return true;
+}
+
+// The reworked board says both things outright: GP24 for USB power, CHG#
+// for whether the charger is still working. CHG# is low for the first charge
+// after power arrives and stays off through later top-ups, so HIGH on USB
+// is "full". With a full cell it still goes low for up to a minute on
+// plugging in, while the charger checks (BQ21040 datasheet, 8.4.11).
+//
+// The original board says neither (docs/hardware.md). USB power is taken
+// from a USB host answering - tud_ready() - which a plain charger or a
+// suspended host does not, and "full" from the voltage, with hysteresis so a
+// cell sitting on the threshold does not flap.
+static PowerSource readPower() {
+    if (powerSense) {
+        if (digitalRead(PIN_VBUS) == LOW) return PWR_BATTERY;
+        return digitalRead(PIN_CHARGE) == LOW ? PWR_CHARGING : PWR_FULL;
+    }
+    if (!tud_ready()) return PWR_BATTERY;
+    int full = (ui.power == PWR_FULL) ? 95 : 100;
+    return ui.battPct >= full ? PWR_FULL : PWR_CHARGING;
+}
+
+static void servicePower() {
+    if ((int32_t)(millis() - nextPowerMs) < 0) return;
+    nextPowerMs = millis() + 1000;
+
+    // Three polls the same before it counts: a host enumerating, or one
+    // briefly suspending the bus, is not an unplug.
+    PowerSource p = readPower();
+    if (p != powerSeen) {
+        powerSeen = p;
+        powerSame = 0;
+        return;
+    }
+    if (++powerSame < 2) return;
+    if (powerKnown && p == ui.power) return;
+
+    static const char *const NAME[] = {"battery", "USB, charging", "USB, charged"};
+    logf("power: %s, %.2f V", NAME[p], (double)battFilt);
+
+    PowerSource was = ui.power;
+    bool news = powerKnown;
+    powerKnown = true;
+    ui.power = p;
+    uiDirty = true;
+
+    // Plugging in or out is done with the pager in hand, so say what it made
+    // of it. Not at boot, and not in app mode, where the screen is the app's.
+    if (!news || Companion::active()) return;
+    if (p == PWR_BATTERY)       toast("ON BATTERY");
+    else if (p == PWR_CHARGING) toast("CHARGING");
+    else                        toast(was == PWR_CHARGING ? "CHARGED" : "ON USB");
+    Ui::wake();
+    lastInteractionMs = millis();
 }
 
 // The LED is the only thing still reporting once the screen has slept, which
@@ -741,7 +980,8 @@ static void serviceIdleLed() {
     else if (Companion::active())      Alerts::setIdle(IDLE_PULSE,   160,   0, 255);
     else if (fetchPending)             Alerts::setIdle(IDLE_BREATHE,   0,  80, 255);
     else if (Messages::unread() > 0)   Alerts::setIdle(IDLE_PULSE,   255,  40,   0);
-    else if (ui.charging)              Alerts::setIdle(IDLE_BREATHE, 255, 120,   0);
+    else if (ui.power == PWR_CHARGING) Alerts::setIdle(IDLE_BREATHE, 255, 120,   0);
+    else if (ui.power == PWR_FULL)     Alerts::setIdle(IDLE_BREATHE,   0, 255,   0);
     else if (!PagerClock::valid())     Alerts::setIdle(IDLE_PULSE,   120, 120,   0);
     else                               Alerts::setIdle(IDLE_PULSE,     0, 255,   0);
 }
@@ -805,10 +1045,14 @@ void setup() {
     Serial.begin(115200);
 
     pinMode(PIN_BUTTON, INPUT_PULLUP);      // no external pull-up on the board
-    // GP13 needs the internal pull-down: the charger's CHG# drives it HIGH
-    // through R21 while charging and leaves it floating otherwise, so with no
-    // pull-down "not charging" reads as whatever the pad last saw.
-    pinMode(PIN_CHARGE, INPUT_PULLDOWN);
+    // GP13 is CHG# on a reworked board, open-drain, so it needs the pull-up.
+    // On the original, R21 holds it at the cell and the pull-up is moot.
+    pinMode(PIN_CHARGE, INPUT_PULLUP);
+    // GP24 stays without pulls on a reworked board - a 50-80k pull beside the
+    // divider's 150k would drag 3.0 V down to about 1.5 V. A floating pad on
+    // the original is parked low instead.
+    powerSense = probePowerSense();
+    if (!powerSense) pinMode(PIN_VBUS, INPUT_PULLDOWN);
     analogReadResolution(12);
 
     watchdog_enable(8000, true);
@@ -934,6 +1178,10 @@ void setup() {
     Serial.printf("call %s  name %s  node %s  route %s\r\n",
                   cfg.call, cfg.meshName, cfg.nodeType, cfg.route);
     Serial.printf("radio: %s\r\n", radioLine);
+    Serial.printf("power: %s (GP24 probe %s, GP13 %s)\r\n", powerSense
+                  ? "USB sense on GP24, CHG# on GP13 - reworked board"
+                  : "no USB sense on GP24 - original board, USB from the host, full from the voltage",
+                  probeTrace, digitalRead(PIN_CHARGE) ? "high" : "low");
     if (Mesh::identityOk()) {
         const uint8_t *pk = Mesh::publicKey();
         Serial.printf("identity: %02X%02X%02X%02X...\r\n", pk[0], pk[1], pk[2], pk[3]);
@@ -955,6 +1203,8 @@ void setup() {
 void loop() {
     watchdog_update();
 
+    if (suspended) { serviceSuspended(); return; }
+
     // Receive first and unconditionally: everything else in this loop is
     // either slow or optional, and the radio has no interrupt to fall back on.
     uint8_t  raw[MC_MAX_TRANS_UNIT];
@@ -969,6 +1219,10 @@ void loop() {
     }
 
     serviceButton();
+    // A release that suspended the pager ends the pass here. The rest of it
+    // would light the LED again from the idle state, and could key the radio
+    // back up for an advert, with nothing left running to undo either.
+    if (suspended) return;
     serviceCompanion();
     Alerts::service();
 
@@ -991,6 +1245,7 @@ void loop() {
     serviceTimeSync();
     serviceAdvert();
     serviceBattery();
+    servicePower();
     serviceIdleLed();
     serviceScreen();
 }

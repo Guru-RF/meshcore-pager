@@ -113,3 +113,12 @@ bool PagerClock::setFromApp(uint32_t unixTime) {
     markSynced();
     return true;
 }
+
+void PagerClock::forget() {
+    baseUnix        = 0;
+    baseMillis      = 0;
+    knownDay        = -1;
+    havePendingTime = false;
+    everSynced      = false;
+    syncedAt        = 0;
+}

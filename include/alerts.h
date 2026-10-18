@@ -29,7 +29,8 @@ enum AlertPattern {
     ALERT_DELETE,       // message dropped
     ALERT_ACK,          // a press was registered
     ALERT_TX,           // an advert went out
-    ALERT_ERROR
+    ALERT_ERROR,
+    ALERT_SUSPEND       // C5 G4 F4 E4, the boot tune backwards: going to sleep
 };
 
 // What the LED does when no pattern is playing.
@@ -54,6 +55,9 @@ void stop();
 // True while a looping alarm is running - that is, while a button press
 // should mean "shut up" rather than "next message".
 bool alarming();
+
+// True while any pattern is running, looping or not.
+bool playing();
 
 void setIdle(AlertIdle mode, uint8_t r, uint8_t g, uint8_t b);
 

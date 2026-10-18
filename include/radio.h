@@ -38,6 +38,10 @@ int poll(uint8_t *buf, size_t bufSz, int16_t *rssi, int8_t *snrQ);
 // exposed for the recovery path.
 void listen();
 
+// Sleep mode, for a suspended pager: the chip keeps its settings and draws
+// next to nothing. listen() wakes it.
+void sleep();
+
 uint32_t timeOnAirMs(size_t len);
 
 // Read the settings back out of the chip, for the boot banner.

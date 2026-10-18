@@ -58,4 +58,10 @@ void     seedFromAdvert(uint32_t unixTime);
 // working phone could report.
 bool     setFromApp(uint32_t unixTime);
 
+// Back to never set, date and all. For a clock that has stopped: millis()
+// stands still while the RP2040 is dormant, so a clock counted from it comes
+// back behind by however long that was - and a stale timestamp is exactly
+// what adverts are gated against.
+void     forget();
+
 }  // namespace PagerClock

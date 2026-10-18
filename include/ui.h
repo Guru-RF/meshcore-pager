@@ -23,6 +23,11 @@
 // Where the position shown came from - see choosePosition() in main.cpp.
 enum PosSource { POS_NONE = 0, POS_HEARD, POS_CONFIG, POS_APP };
 
+// What the pager is running on - see readPower() in main.cpp. Both USB
+// states mean the charger has power; PWR_FULL is the charger saying it is
+// done (or, on the original board, the voltage saying so).
+enum PowerSource { PWR_BATTERY = 0, PWR_CHARGING, PWR_FULL };
+
 enum UiView {
     VIEW_BOOT = 0,      // splash and setup progress
     VIEW_MESSAGE,       // a message, or the empty-store screen
@@ -46,7 +51,7 @@ struct UiModel {
 
     float    battVolts;
     int      battPct;
-    bool     charging;
+    PowerSource power;
 
     bool     radioOk;
     bool     identityOk;
